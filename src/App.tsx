@@ -227,7 +227,12 @@ async function syncPendingSos(): Promise<void> {
     })
 
     if (!response.ok) {
-      throw new Error(`SOS sync failed with status ${response.status}`)
+      const details = await response.text()
+      throw new Error(
+        `SOS sync failed with status ${response.status} ${response.statusText}${
+          details ? `: ${details}` : ''
+        }`,
+      )
     }
 
     await deletePendingSos(item.id)
@@ -308,7 +313,7 @@ async function submitPrompt(manager: WorkerManager, prompt: string): Promise<voi
     .map((match) => `${match.title}: ${match.text}`)
 
   const history: ChatMessage[] = chatTurns.value
-    .slice(-6)
+    .slice(-4)
     .map((turn) => ({
       role: turn.role,
       content: turn.content,
