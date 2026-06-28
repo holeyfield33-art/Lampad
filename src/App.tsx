@@ -44,6 +44,8 @@ const SOS_ENDPOINT = import.meta.env.VITE_SOS_ENDPOINT ?? 'https://lampad-backen
 const DISTRESS_STORE = 'pending_sos'
 const KNOWLEDGE_THRESHOLD = 0.35
 const TOP_K = 3
+const PING_ATTEMPTS = 3
+const MAX_SCAN_LOGS = 8
 
 const knowledgeSeed: KnowledgeEntry[] = [
   {
@@ -244,13 +246,13 @@ async function syncPendingSos(): Promise<void> {
 async function measurePing(manager: WorkerManager, target: 'inference' | 'retrieval'): Promise<number> {
   let total = 0
 
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 0; attempt < PING_ATTEMPTS; attempt += 1) {
     const startedAt = performance.now()
     await manager.send(target, 'PING', null)
     total += performance.now() - startedAt
   }
 
-  return total / 3
+  return total / PING_ATTEMPTS
 }
 
 async function bootWorkers(manager: WorkerManager): Promise<void> {
@@ -306,7 +308,7 @@ async function submitPrompt(manager: WorkerManager, prompt: string): Promise<voi
       matches: searchResult.matches,
     },
     ...scanLogs.value,
-  ].slice(0, 8)
+  ].slice(0, MAX_SCAN_LOGS)
 
   const context = searchResult.matches
     .filter((match) => match.score >= KNOWLEDGE_THRESHOLD)

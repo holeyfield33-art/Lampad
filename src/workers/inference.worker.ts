@@ -29,6 +29,9 @@ const DISTRESS_TERMS = [
   'domestic violence',
   'emergency',
 ]
+const DISTRESS_PATTERNS = DISTRESS_TERMS.map(
+  (term) => new RegExp(`\\b${term.replace(/\s+/g, '\\s+')}\\b`, 'i'),
+)
 
 let enginePromise: Promise<MLCEngine> | null = null
 
@@ -105,8 +108,7 @@ async function ensureEngine(
 }
 
 function scanForDistress(prompt: string): string[] {
-  const lower = prompt.toLowerCase()
-  return DISTRESS_TERMS.filter((term) => new RegExp(`\\b${term.replace(/\s+/g, '\\s+')}\\b`, 'i').test(lower))
+  return DISTRESS_TERMS.filter((_, index) => DISTRESS_PATTERNS[index].test(prompt))
 }
 
 function buildMessages(request: ChatRequest): ChatMessage[] {
