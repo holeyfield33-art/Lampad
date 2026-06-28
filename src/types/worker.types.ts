@@ -1,5 +1,8 @@
 export type AppMode = 'INFO' | 'LEARN'
 
+export const DEFAULT_SOS_ENDPOINT = 'https://lampad-backend.onrender.com/api/sos'
+export const MAX_CHAT_HISTORY = 4
+
 export type WorkerRequestType =
   | 'PING'
   | 'INIT_INFERENCE'

@@ -8,6 +8,7 @@ import type {
   KnowledgeEntry,
   SearchResponsePayload,
 } from './types/worker.types'
+import { DEFAULT_SOS_ENDPOINT, MAX_CHAT_HISTORY } from './types/worker.types'
 import { WorkerManager } from './workers/WorkerManager'
 
 type TabKey = 'chat' | 'rag'
@@ -40,7 +41,7 @@ type PendingSosRecord = {
   createdAt: string
 }
 
-const SOS_ENDPOINT = import.meta.env.VITE_SOS_ENDPOINT ?? 'https://lampad-backend.onrender.com/api/sos'
+const SOS_ENDPOINT = import.meta.env.VITE_SOS_ENDPOINT ?? DEFAULT_SOS_ENDPOINT
 const DISTRESS_STORE = 'pending_sos'
 const KNOWLEDGE_THRESHOLD = 0.35
 const TOP_K = 3
@@ -315,7 +316,7 @@ async function submitPrompt(manager: WorkerManager, prompt: string): Promise<voi
     .map((match) => `${match.title}: ${match.text}`)
 
   const history: ChatMessage[] = chatTurns.value
-    .slice(-4)
+    .slice(-MAX_CHAT_HISTORY)
     .map((turn) => ({
       role: turn.role,
       content: turn.content,

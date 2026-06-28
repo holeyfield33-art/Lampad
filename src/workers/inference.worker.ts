@@ -13,6 +13,7 @@ import type {
   WorkerResultResponse,
   WorkerStreamResponse,
 } from '../types/worker.types'
+import { MAX_CHAT_HISTORY } from '../types/worker.types'
 
 const selfRef = self as DedicatedWorkerGlobalScope
 const MODEL_ID = 'Qwen2.5-0.5B-Instruct-q4f16_1-MLC'
@@ -133,7 +134,7 @@ function buildMessages(request: ChatRequest): ChatMessage[] {
 
   return [
     { role: 'system', content: systemPrompt },
-    ...request.history.slice(-4),
+    ...request.history.slice(-MAX_CHAT_HISTORY),
     { role: 'user', content: request.prompt },
   ]
 }
