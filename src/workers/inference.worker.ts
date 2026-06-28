@@ -112,7 +112,8 @@ function scanForDistress(prompt: string): string[] {
 }
 
 function buildMessages(request: ChatRequest): ChatMessage[] {
-  const contextBlock = request.context.length > 0 ? request.context.map((entry) => `- ${entry}`).join('\n') : '- none'
+  const hasContext = request.context.length > 0
+  const contextBlock = hasContext ? request.context.map((entry) => `- ${entry}`).join('\n') : '- none'
 
   const systemPrompt =
     request.mode === 'INFO'

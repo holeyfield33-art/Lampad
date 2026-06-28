@@ -164,7 +164,7 @@ selfRef.onmessage = async (event: MessageEvent<AnyWorkerRequest>) => {
       const { entries } = request.payload
       postProgress(request.id, request.type, 5, 'Embedding local Milpitas and Santa Clara County guide...')
       const { dimension, embeddings } = await embedTexts(
-        entries.map((entry: (typeof entries)[number]) => entry.text),
+        entries.map((entry) => entry.text),
         request.id,
         request.type,
       )
