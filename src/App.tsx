@@ -47,6 +47,7 @@ const KNOWLEDGE_THRESHOLD = 0.35
 const TOP_K = 3
 const PING_ATTEMPTS = 3
 const MAX_SCAN_LOGS = 8
+const MODEL_SIZE_LABEL = '400MB'
 
 const knowledgeSeed: KnowledgeEntry[] = [
   {
@@ -219,29 +220,40 @@ async function syncPendingSos(): Promise<void> {
   }
 
   const pendingItems = await listPendingSos()
+  const failures: string[] = []
 
   for (const item of pendingItems) {
-    const response = await fetch(SOS_ENDPOINT, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(item),
-    })
+    try {
+      const response = await fetch(SOS_ENDPOINT, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(item),
+      })
 
-    if (!response.ok) {
-      const details = await response.text()
-      throw new Error(
-        `SOS sync failed with status ${response.status} ${response.statusText}${
-          details ? `: ${details}` : ''
-        }`,
-      )
+      if (!response.ok) {
+        const details = await response.text()
+        throw new Error(
+          `SOS sync failed with status ${response.status} ${response.statusText}${
+            details ? `: ${details}` : ''
+          }`,
+        )
+      }
+
+      await deletePendingSos(item.id)
+    } catch (error) {
+      failures.push(error instanceof Error ? error.message : 'Unknown SOS sync failure.')
     }
-
-    await deletePendingSos(item.id)
   }
 
   await refreshPendingCount()
+
+  if (failures.length > 0) {
+    throw new Error(
+      `SOS sync completed with ${failures.length} pending packet(s) remaining. ${failures[0]}`,
+    )
+  }
 }
 
 async function measurePing(manager: WorkerManager, target: 'inference' | 'retrieval'): Promise<number> {
@@ -287,6 +299,12 @@ async function bootWorkers(manager: WorkerManager): Promise<void> {
 async function submitPrompt(manager: WorkerManager, prompt: string): Promise<void> {
   const requestId = crypto.randomUUID()
   const startedAt = performance.now()
+  const history: ChatMessage[] = chatTurns.value
+    .slice(-MAX_CHAT_HISTORY)
+    .map((turn) => ({
+      role: turn.role,
+      content: turn.content,
+    }))
 
   chatTurns.value = [
     ...chatTurns.value,
@@ -314,13 +332,6 @@ async function submitPrompt(manager: WorkerManager, prompt: string): Promise<voi
   const context = searchResult.matches
     .filter((match) => match.score >= KNOWLEDGE_THRESHOLD)
     .map((match) => `${match.title}: ${match.text}`)
-
-  const history: ChatMessage[] = chatTurns.value
-    .slice(-MAX_CHAT_HISTORY)
-    .map((turn) => ({
-      role: turn.role,
-      content: turn.content,
-    }))
 
   const finalResponse = await manager.send('inference', 'CHAT', {
     mode: chatMode.value,
@@ -396,7 +407,10 @@ export function App() {
   useEffect(() => {
     if (modelDownloadProgress.value >= 100 && !modelVerified.value) {
       modelVerified.value = true
-      pushToast('400MB model verified', 'Qwen2.5 local weights finished downloading and are ready offline.')
+      pushToast(
+        `${MODEL_SIZE_LABEL} model verified`,
+        'Qwen2.5 local weights finished downloading and are ready offline.',
+      )
     }
   }, [modelDownloadProgress.value])
 
@@ -423,7 +437,7 @@ export function App() {
                 {bundleInfo.value ? `${bundleInfo.value.dimension}D bundle ready` : 'Seeding vectors...'}
               </span>
               <span class="rounded-full border border-amber-500/40 bg-amber-500/10 px-3 py-1 text-xs font-semibold text-amber-200">
-                {modelVerified.value ? '400MB model verified' : 'Model warm-up pending'}
+                {modelVerified.value ? `${MODEL_SIZE_LABEL} model verified` : 'Model warm-up pending'}
               </span>
             </div>
           </div>

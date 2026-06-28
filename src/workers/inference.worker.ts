@@ -29,9 +29,9 @@ const DISTRESS_TERMS = [
   'no shelter',
   'domestic violence',
   'emergency',
-]
-const DISTRESS_PATTERNS = DISTRESS_TERMS.map(
-  (term) => new RegExp(`\\b${term.replace(/\s+/g, '\\s+')}\\b`, 'i'),
+] as const
+const DISTRESS_PATTERNS = new Map(
+  DISTRESS_TERMS.map((term) => [term, new RegExp(`\\b${term.replace(/\s+/g, '\\s+')}\\b`, 'i')]),
 )
 
 let enginePromise: Promise<MLCEngine> | null = null
@@ -109,7 +109,7 @@ async function ensureEngine(
 }
 
 function scanForDistress(prompt: string): string[] {
-  return DISTRESS_TERMS.filter((_, index) => DISTRESS_PATTERNS[index].test(prompt))
+  return DISTRESS_TERMS.filter((term) => DISTRESS_PATTERNS.get(term)?.test(prompt) ?? false)
 }
 
 function buildMessages(request: ChatRequest): ChatMessage[] {

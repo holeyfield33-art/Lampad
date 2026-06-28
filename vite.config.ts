@@ -2,7 +2,7 @@ import { defineConfig } from 'vite'
 import preact from '@preact/preset-vite'
 import { VitePWA } from 'vite-plugin-pwa'
 
-const FIVE_HUNDRED_MB = 500 * 1024 * 1024
+const MAX_CACHE_SIZE_BYTES = 500 * 1024 * 1024
 
 export default defineConfig({
   plugins: [
@@ -12,7 +12,7 @@ export default defineConfig({
       injectRegister: 'auto',
       workbox: {
         globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2,json}'],
-        maximumFileSizeToCacheInBytes: FIVE_HUNDRED_MB,
+        maximumFileSizeToCacheInBytes: MAX_CACHE_SIZE_BYTES,
         runtimeCaching: [
           {
             urlPattern: /^https:\/\/huggingface\.co\/.*/i,
