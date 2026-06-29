@@ -1,13 +1,23 @@
-previewsEnabled: true
 services:
-  - type: static
+  # Frontend Web Application (AtlasBridge)
+  - type: web
     name: lampad-atlasbridge
-    runtime: static
-    buildCommand: npm ci && npm run build
-    staticPublishPath: dist
-    pullRequestPreviewsEnabled: true
+    env: static
+    buildCommand: npm run build
+    publishPath: dist
+    headers:
+      - key: Cross-Origin-Opener-Policy
+        value: same-origin
+      - key: Cross-Origin-Embedder-Policy
+        value: require-corp
+
+  # Backend Webhook Mapping
+  - type: web
+    name: lampad-backend
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
     envVars:
-      - key: VITE_SOS_ENDPOINT
-        value: https://lampad-backend.onrender.com/api/sos
-      - key: VITE_BACKEND_WEBHOOK_BASE
-        value: https://lampad-backend.onrender.com/api
+      - key: PORT
+        value: 10000

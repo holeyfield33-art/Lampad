@@ -1,220 +1,202 @@
-/// <reference lib="webworker" />
+import { pipeline } from '@xenova/transformers';
+import { WorkerRequest, WorkerResponse } from '../types/worker.types';
 
-import { env, pipeline, type FeatureExtractionPipeline, type Tensor } from '@xenova/transformers'
+let extractor: any = null;
+let useFallback = false;
 
-import type {
-  AnyWorkerRequest,
-  KnowledgeBundle,
-  SearchMatch,
-  WorkerErrorResponse,
-  WorkerProgressResponse,
-  WorkerRequest,
-  WorkerResponse,
-  WorkerResultResponse,
-} from '../types/worker.types'
-
-const selfRef = self as DedicatedWorkerGlobalScope
-const RETRIEVAL_MODEL = 'Xenova/paraphrase-multilingual-MiniLM-L12-v2'
-
-let knowledgeBundle: KnowledgeBundle | null = null
-let extractorPromise: Promise<FeatureExtractionPipeline> | null = null
-
-env.allowLocalModels = false
-env.useBrowserCache = true
-
-function postResult<T extends WorkerRequest['type']>(
-  id: string,
-  requestType: T,
-  payload: Extract<WorkerResultResponse<T>, { type: 'RESULT' }>['payload'],
-): void {
-  const response: WorkerResultResponse<T> = {
-    id,
-    requestType,
-    type: 'RESULT',
-    payload,
-  }
-
-  selfRef.postMessage(response satisfies WorkerResponse<T>)
+interface Document {
+  chunk: string;
+  embedding: Float32Array;
 }
 
-function postProgress<T extends WorkerRequest['type']>(
-  id: string,
-  requestType: T,
-  progress: number,
-  message: string,
-): void {
-  const response: WorkerProgressResponse<T> = {
-    id,
-    requestType,
-    type: 'PROGRESS',
-    payload: {
-      stage: 'retrieval',
-      progress,
-      message,
-    },
+let database: Document[] = [];
+
+/**
+ * High-performance Fallback Vectorizer: Token-Hashing & Normalization
+ * Generates a stable 384-dimensional unit vector based on text content.
+ * Dot products of these vectors correspond directly to token overlap.
+ */
+function generateFallbackEmbedding(text: string): Float32Array {
+  const vector = new Float32Array(384);
+  const clean = text.toLowerCase().replace(/[^a-z0-9\s]/g, '');
+  const tokens = clean.split(/\s+/).filter(t => t.length > 1);
+
+  if (tokens.length === 0) {
+    // Return unit constant vector
+    const val = 1.0 / Math.sqrt(384);
+    vector.fill(val);
+    return vector;
   }
 
-  selfRef.postMessage(response satisfies WorkerResponse<T>)
-}
-
-function postError<T extends WorkerRequest['type']>(id: string, requestType: T, error: unknown): void {
-  const response: WorkerErrorResponse<T> = {
-    id,
-    requestType,
-    type: 'ERROR',
-    error: error instanceof Error ? error.message : 'Unknown retrieval worker error.',
-  }
-
-  selfRef.postMessage(response satisfies WorkerResponse<T>)
-}
-
-async function ensureExtractor(
-  id: string,
-  requestType: WorkerRequest['type'],
-): Promise<FeatureExtractionPipeline> {
-  if (!extractorPromise) {
-    extractorPromise = pipeline('feature-extraction', RETRIEVAL_MODEL, {
-      progress_callback: (progress: { progress?: number; status?: string; file?: string }) => {
-        const fraction = typeof progress.progress === 'number' ? progress.progress * 100 : 0
-        const label =
-          typeof progress.status === 'string'
-            ? progress.status
-            : typeof progress.file === 'string'
-              ? progress.file
-              : 'Loading multilingual embedding model...'
-
-        postProgress(id, requestType, fraction, label)
-      },
-    })
-  }
-
-  return extractorPromise
-}
-
-async function embedTexts(
-  texts: string[],
-  id: string,
-  requestType: WorkerRequest['type'],
-): Promise<{ dimension: number; embeddings: Float32Array }> {
-  const extractor = await ensureExtractor(id, requestType)
-  const tensor = (await extractor(texts, { pooling: 'mean', normalize: true })) as Tensor
-  const typedArray =
-    tensor.data instanceof Float32Array ? tensor.data : Float32Array.from(tensor.data as ArrayLike<number>)
-  const dimension = tensor.dims[tensor.dims.length - 1] ?? 0
-
-  return {
-    dimension,
-    embeddings: typedArray,
-  }
-}
-
-function cosineSearch(
-  queryEmbedding: Float32Array,
-  bundle: KnowledgeBundle,
-  topK: number,
-): { matches: SearchMatch[]; searchMs: number } {
-  const startedAt = performance.now()
-  const results: SearchMatch[] = []
-
-  for (let row = 0; row < bundle.entries.length; row += 1) {
-    let score = 0
-    const offset = row * bundle.dimension
-
-    for (let column = 0; column < bundle.dimension; column += 1) {
-      score += queryEmbedding[column] * bundle.embeddings[offset + column]
+  // Hash each token to an index in [0, 383] and accumulate weights
+  for (const token of tokens) {
+    let hash = 0;
+    for (let i = 0; i < token.length; i++) {
+      hash = (hash << 5) - hash + token.charCodeAt(i);
+      hash |= 0; // Convert to 32bit integer
     }
-
-    results.push({
-      ...bundle.entries[row],
-      score,
-    })
+    const idx = Math.abs(hash) % 384;
+    vector[idx] += 1.0;
   }
 
-  results.sort((left, right) => right.score - left.score)
-
-  return {
-    matches: results.slice(0, topK),
-    searchMs: performance.now() - startedAt,
+  // Calculate magnitude and normalize to unit length
+  let sumSq = 0;
+  for (let i = 0; i < 384; i++) {
+    sumSq += vector[i] * vector[i];
   }
+  const mag = Math.sqrt(sumSq);
+
+  if (mag > 0) {
+    for (let i = 0; i < 384; i++) {
+      vector[i] /= mag;
+    }
+  }
+
+  return vector;
 }
 
-selfRef.onmessage = async (event: MessageEvent<AnyWorkerRequest>) => {
-  const request = event.data
+/**
+ * Calculates dot product between two normalized vectors (Cosine Similarity)
+ */
+function cosineSimilarity(a: Float32Array, b: Float32Array): number {
+  let dot = 0;
+  const len = a.length;
+  for (let i = 0; i < len; i++) {
+    dot += a[i] * b[i];
+  }
+  return dot;
+}
 
-  try {
-    if (request.type === 'PING') {
-      postResult(request.id, request.type, {
-        pong: true,
-        worker: 'retrieval',
-        receivedAt: performance.now(),
-      })
-      return
+self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
+  const { id, type, payload } = event.data;
+
+  if (type === 'PING') {
+    self.postMessage({ id, type, status: 'SUCCESS', payload: 'PONG' });
+    return;
+  }
+
+  if (type === 'INIT_ENGINE') {
+    try {
+      self.postMessage({
+        id,
+        type,
+        status: 'PROGRESS',
+        payload: { progress: 0.2, text: 'Initializing transformer environment...' }
+      });
+
+      // Load Xenova's multilingual paraphrase extractor
+      extractor = await pipeline('feature-extraction', 'Xenova/paraphrase-multilingual-MiniLM-L12-v2', {
+        progress_callback: (info: any) => {
+          if (info.status === 'progress') {
+            self.postMessage({
+              id,
+              type,
+              status: 'PROGRESS',
+              payload: { progress: 0.2 + (info.progress / 100) * 0.7, text: `Loading model files: ${info.file} (${Math.round(info.progress)}%)` }
+            });
+          }
+        }
+      });
+
+      self.postMessage({ id, type, status: 'SUCCESS', payload: { fallback: false } });
+    } catch (err: any) {
+      console.warn('Transformer loading failed, running high-performance Token-Hashing Fallback:', err);
+      useFallback = true;
+      self.postMessage({ id, type, status: 'SUCCESS', payload: { fallback: true, error: err.message } });
     }
+    return;
+  }
 
-    if (request.type === 'INIT_RETRIEVAL') {
-      await ensureExtractor(request.id, request.type)
-      postResult(request.id, request.type, {
-        model: RETRIEVAL_MODEL,
-        ready: true,
-      })
-      return
-    }
+  if (type === 'VECTORIZE_BUNDLE') {
+    const { chunks } = payload as { chunks: string[] };
 
-    if (request.type === 'SEED_KNOWLEDGE') {
-      const { entries } = request.payload
-      postProgress(request.id, request.type, 5, 'Embedding local Milpitas and Santa Clara County guide...')
-      const { dimension, embeddings } = await embedTexts(
-        entries.map((entry) => entry.text),
-        request.id,
-        request.type,
-      )
+    try {
+      database = [];
 
-      knowledgeBundle = {
-        model: RETRIEVAL_MODEL,
-        dimension,
-        createdAt: new Date().toISOString(),
-        entries,
-        embeddings,
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        let embedding: Float32Array;
+
+        if (useFallback || !extractor) {
+          embedding = generateFallbackEmbedding(chunk);
+        } else {
+          const output = await extractor(chunk, { pooling: 'mean', normalize: true });
+          embedding = new Float32Array(output.data);
+        }
+
+        database.push({ chunk, embedding });
+
+        self.postMessage({
+          id,
+          type,
+          status: 'PROGRESS',
+          payload: {
+            current: i + 1,
+            total: chunks.length,
+            percent: Math.round(((i + 1) / chunks.length) * 100)
+          }
+        });
       }
 
-      postResult(request.id, request.type, knowledgeBundle)
-      return
+      self.postMessage({
+        id,
+        type,
+        status: 'SUCCESS',
+        payload: { count: database.length, dimension: 384 }
+      });
+    } catch (err: any) {
+      self.postMessage({ id, type, status: 'ERROR', payload: err.message });
     }
+    return;
+  }
 
-    if (request.type === 'SEARCH_KNOWLEDGE') {
-      const { payload } = request
+  if (type === 'COSINE_SEARCH') {
+    const { query, topK } = payload as { query: string; topK: number };
 
-      if (!knowledgeBundle) {
-        postResult(request.id, request.type, {
-          bundleReady: false,
-          query: payload.query,
-          topK: payload.topK,
-          threshold: payload.threshold,
-          searchMs: 0,
-          matches: [],
-        })
-        return
+    try {
+      if (database.length === 0) {
+        self.postMessage({ id, type, status: 'SUCCESS', payload: [] });
+        return;
       }
 
-      const { embeddings } = await embedTexts([payload.query], request.id, request.type)
-      const queryEmbedding = embeddings.slice(0, knowledgeBundle.dimension)
-      const { matches, searchMs } = cosineSearch(queryEmbedding, knowledgeBundle, payload.topK)
+      // Generate query embedding
+      let queryVec: Float32Array;
+      if (useFallback || !extractor) {
+        queryVec = generateFallbackEmbedding(query);
+      } else {
+        const output = await extractor(query, { pooling: 'mean', normalize: true });
+        queryVec = new Float32Array(output.data);
+      }
 
-      postResult(request.id, request.type, {
-        bundleReady: true,
-        query: payload.query,
-        topK: payload.topK,
-        threshold: payload.threshold,
-        searchMs,
-        matches,
-      })
-      return
+      // Measure search performance
+      const t0 = performance.now();
+
+      // Scan and calculate similarity
+      const results = database.map(doc => {
+        const score = cosineSimilarity(queryVec, doc.embedding);
+        return {
+          chunk: doc.chunk,
+          score: parseFloat(score.toFixed(4))
+        };
+      });
+
+      // Sort by descending score
+      results.sort((a, b) => b.score - a.score);
+
+      const topResults = results.slice(0, topK);
+      const scanTime = performance.now() - t0;
+
+      // Log latency diagnostics
+      console.log(`[Retrieval Worker] Cosine search complete in ${scanTime.toFixed(2)}ms for ${database.length} chunks.`);
+
+      self.postMessage({
+        id,
+        type,
+        status: 'SUCCESS',
+        payload: topResults
+      });
+    } catch (err: any) {
+      self.postMessage({ id, type, status: 'ERROR', payload: err.message });
     }
-
-    throw new Error(`Unsupported retrieval worker request: ${request.type}`)
-  } catch (error) {
-    postError(request.id, request.type, error)
   }
-}
-
-export {}
+});

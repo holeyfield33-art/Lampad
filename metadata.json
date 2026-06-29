@@ -1,0 +1,6 @@
+{
+  "name": "Lampad AtlasBridge",
+  "description": "Progressive, offline-first newcomer assistant utilizing on-device WebGPU models and vector similarity search.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

@@ -1,56 +1,57 @@
-import { defineConfig } from 'vite'
-import preact from '@preact/preset-vite'
-import { VitePWA } from 'vite-plugin-pwa'
+import preact from '@preact/preset-vite';
+import tailwindcss from '@tailwindcss/vite';
+import path from 'path';
+import {defineConfig} from 'vite';
+import {VitePWA} from 'vite-plugin-pwa';
 
-const MAX_CACHE_SIZE_BYTES = 500 * 1024 * 1024
-
-export default defineConfig({
-  plugins: [
-    preact(),
-    VitePWA({
-      registerType: 'autoUpdate',
-      injectRegister: 'auto',
-      workbox: {
-        globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2,json}'],
-        maximumFileSizeToCacheInBytes: MAX_CACHE_SIZE_BYTES,
-        runtimeCaching: [
-          {
-            urlPattern: /^https:\/\/huggingface\.co\/.*/i,
-            handler: 'CacheFirst',
-            options: {
-              cacheName: 'atlasbridge-model-cache',
-              expiration: {
-                maxEntries: 64,
-                maxAgeSeconds: 60 * 60 * 24 * 30,
-              },
+export default defineConfig(() => {
+  return {
+    plugins: [
+      preact(),
+      tailwindcss(),
+      VitePWA({
+        registerType: 'autoUpdate',
+        workbox: {
+          maximumFileSizeToCacheInBytes: 524288000, // 500MB
+          globPatterns: ['**/*.{js,css,html,ico,png,svg,wasm}']
+        },
+        manifest: {
+          name: 'Lampad AtlasBridge',
+          short_name: 'AtlasBridge',
+          description: 'Offline-first newcomer assistant with on-device LLM & vector search.',
+          theme_color: '#0f172a',
+          background_color: '#0f172a',
+          display: 'standalone',
+          icons: [
+            {
+              src: 'pwa-192x192.png',
+              sizes: '192x192',
+              type: 'image/png'
             },
-          },
-          {
-            urlPattern: /^https:\/\/lampad-backend\.onrender\.com\/.*/i,
-            handler: 'NetworkOnly',
-          },
-        ],
+            {
+              src: 'pwa-512x512.png',
+              sizes: '512x512',
+              type: 'image/png'
+            }
+          ]
+        }
+      })
+    ],
+    worker: {
+      format: 'es' as const,
+    },
+    resolve: {
+      alias: {
+        '@': path.resolve(__dirname, './src'),
+        'react': 'preact/compat',
+        'react-dom/test-utils': 'preact/compat/test-utils',
+        'react-dom': 'preact/compat',
+        'react/jsx-runtime': 'preact/compat/jsx-runtime',
       },
-      manifest: {
-        name: 'Lampad AtlasBridge',
-        short_name: 'AtlasBridge',
-        description: 'Offline-first newcomer assistant for grounded local survival guidance.',
-        theme_color: '#0f172a',
-        background_color: '#020617',
-        display: 'standalone',
-        start_url: '/',
-      },
-      devOptions: {
-        enabled: true,
-        type: 'module',
-      },
-    }),
-  ],
-  build: {
-    target: 'es2023',
-    sourcemap: true,
-  },
-  worker: {
-    format: 'es',
-  },
-})
+    },
+    server: {
+      hmr: process.env.DISABLE_HMR !== 'true',
+      watch: process.env.DISABLE_HMR === 'true' ? null : {},
+    },
+  };
+});
