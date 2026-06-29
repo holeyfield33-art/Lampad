@@ -117,8 +117,9 @@ async function triggerAutomatedSync() {
             })
           });
 
-          if (res.ok || res.status === 404 || res.status === 500) {
-            // Even if endpoint has offline test error, mark synced locally on status reply
+          if (res.ok) {
+            // Only mark synced on a successful (2xx) delivery; failed
+            // attempts stay queued so emergency records are never dropped.
             const tx = db.transaction('pending_sos', 'readwrite');
             const store = tx.objectStore('pending_sos');
             const record = { ...log, synced: true };
@@ -127,6 +128,8 @@ async function triggerAutomatedSync() {
               req.onsuccess = () => resolve();
               req.onerror = () => reject();
             });
+          } else {
+            console.warn(`[Sync Engine] Backend returned ${res.status}; keeping log queued for retry.`);
           }
         } catch (postErr) {
           console.warn('[Sync Engine] Backend unavailable, keeping offline logs armed:', postErr);

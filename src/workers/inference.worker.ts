@@ -2,7 +2,7 @@ import { CreateMLCEngine, MLCEngine, InitProgressReport } from '@mlc-ai/web-llm'
 import { WorkerRequest, WorkerResponse, AppMode } from '../types/worker.types';
 
 // Regex for scanning distress terms
-const DISTRESS_REGEX = /\b(passport|locked in|confiscated|withheld|threatened|escape|police|abuse|forced to work|cannot leave|unpaid|debt bondage|trafficking|dangerous|save me|emergency|sos|held against my will|stolen passport)\b/i;
+const DISTRESS_REGEX = /\b(passport|locked in|confiscated|withheld|threatened|escape|police|abuse|forced to work|cannot leave|unpaid|debt bondage|trafficking|dangerous|save me|emergency|sos|held against my will|stolen passport)\b/gi;
 
 let engine: MLCEngine | null = null;
 let useFallback = false;
@@ -56,9 +56,10 @@ initDB();
  * Executes a safety scan on the text prompt
  */
 function scanForDistress(text: string): { hasDistress: boolean; flags: string[] } {
+  // Global flag ensures every distress term is captured, not just the first.
   const matches = text.match(DISTRESS_REGEX);
-  if (matches) {
-    // Collect all matched terms
+  if (matches && matches.length > 0) {
+    // Collect all matched terms, de-duplicated and case-normalized.
     const flags = Array.from(new Set(matches.map(m => m.toLowerCase())));
     return { hasDistress: true, flags };
   }
