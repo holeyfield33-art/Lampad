@@ -28,8 +28,7 @@ import {
 } from './lib/db';
 import { ALL_PASSAGES, BUNDLES, PASSAGE_BY_TEXT, type Passage } from './data';
 import { LESSONS, type Lesson } from './data/lessons';
-
-const COUNTY_PASSAGES = ALL_PASSAGES.map(p => p.text);
+import { passagesOf, syncBundles } from './lib/bundleSync';
 
 // Endpoint that queued SOS packets are forwarded to once connectivity returns.
 // Documented in .env.example as VITE_SOS_ENDPOINT; falls back to the hosted
@@ -64,6 +63,13 @@ const inferencePingMs = signal<number>(0);
 const retrievalPingMs = signal<number>(0);
 const pingTestPassed = signal<boolean>(false);
 const dbChunksCount = signal<number>(0);
+
+// Knowledge packs actually indexed this session. Starts as the packs compiled
+// into the app and is replaced by the merged set once the hub has been checked.
+const activePassages = signal(ALL_PASSAGES);
+/** Text -> passage, rebuilt whenever the indexed set changes. */
+const passageByText = () => new Map(activePassages.value.map(p => [p.text, p]));
+const bundleSyncStatus = signal<string>('built-in packs');
 
 // SOS sync state
 const pendingSosRecords = signal<SOSRecord[]>([]);
@@ -224,9 +230,18 @@ async function handleSendMessage() {
   try {
     // 3. Step A: Context Retrieval (vector database cosine search)
     let contextStr = '';
-    let topMatches: Array<{ chunk: string; score: number; grounded?: boolean }> = [];
+    let topMatches: Array<{ chunk: string; score: number; grounded?: boolean; passage?: unknown }> = [];
     if (currentAppMode === 'INFO') {
-      topMatches = (await workerManager.cosineSearch(promptText, 3)) || [];
+      const found = (await workerManager.cosineSearch(promptText, 3)) || [];
+      // Attach provenance so the worker can cite passages it was never
+      // compiled with (anything that arrived from the hub).
+      const lookup = passageByText();
+      topMatches = found.map(m => {
+        const p = lookup.get(m.chunk);
+        return p
+          ? { ...m, passage: { source: p.source, citation: p.citation, url: p.url, verifiedBy: p.verifiedBy } }
+          : m;
+      });
       if (topMatches.length > 0) {
         contextStr = topMatches.map(m => m.chunk).join('\n\n');
       }
@@ -328,9 +343,27 @@ export default function App() {
         });
         isEmbeddingLoaded.value = true;
 
-        // 2. Localized Compiler Workflow: Seed database text passages to Retrieval Worker
-        console.log('[Compiler] Seeding emergency and transit guide passages...');
-        const bundleInfo = await workerManager.vectorizeBundle(COUNTY_PASSAGES);
+        // 2. Pull any updated knowledge packs from the hub, then index whatever
+        // we ended up with. syncBundles never throws — offline or an
+        // unreachable hub just means the cached or built-in packs.
+        const sync = await syncBundles();
+        activePassages.value = passagesOf(sync.bundles);
+        bundleSyncStatus.value =
+          sync.status === 'updated'
+            ? `updated ${sync.updated.join(', ')}`
+            : sync.status === 'current'
+              ? 'packs up to date'
+              : sync.status === 'offline'
+                ? 'offline — using stored packs'
+                : 'hub unreachable — using stored packs';
+        if (sync.rejected.length > 0) {
+          bundleSyncStatus.value += ` (${sync.rejected.length} rejected)`;
+        }
+
+        console.log(`[Compiler] Indexing ${activePassages.value.length} passages...`);
+        const bundleInfo = await workerManager.vectorizeBundle(
+          activePassages.value.map(p => p.text)
+        );
         dbChunksCount.value = bundleInfo.count;
 
         // 3. Ping Verification Test (Ensure response under 5ms)
@@ -610,8 +643,11 @@ export default function App() {
                 </div>
               ))}
               <p className="text-[10px] text-industrial-ink/60 font-sans leading-normal pt-1">
-                {dbChunksCount.value} of {ALL_PASSAGES.length} passages indexed. Every answer cites the
-                passage it came from.
+                {dbChunksCount.value} of {activePassages.value.length} passages indexed. Every answer
+                cites the passage it came from.
+                <span className="block font-mono text-[9px] uppercase tracking-wide mt-1 opacity-70">
+                  Hub: {bundleSyncStatus.value}
+                </span>
               </p>
             </div>
           </div>
@@ -950,8 +986,8 @@ export default function App() {
                             <span className="font-bold">#MATCH-0{index + 1}</span>
                             <span className="truncate pr-4 font-sans font-medium italic">"{res.chunk}"</span>
                             <span className="opacity-75 font-mono text-[9px] leading-tight">
-                              {PASSAGE_BY_TEXT.get(res.chunk)?.citation
-                                || PASSAGE_BY_TEXT.get(res.chunk)?.source
+                              {passageByText().get(res.chunk)?.citation
+                                || passageByText().get(res.chunk)?.source
                                 || 'UNSOURCED'}
                             </span>
                             <span className={`font-bold ${res.grounded === false ? 'text-industrial-warning' : 'text-industrial-accent'}`}>
@@ -966,10 +1002,10 @@ export default function App() {
 
                 {/* 2. Entire knowledge database printout */}
                 <div className="space-y-3 pt-4 border-t border-industrial-ink/20">
-                  <span className="col-header">Indexed knowledge base ({ALL_PASSAGES.length} passages, all cited)</span>
+                  <span className="col-header">Indexed knowledge base ({activePassages.value.length} passages, all cited)</span>
                   
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    {ALL_PASSAGES.map((p, index) => (
+                    {activePassages.value.map((p, index) => (
                       <div key={index} className="p-3 bg-industrial-paper border border-industrial-ink/50 hover:border-industrial-ink transition text-xs space-y-1.5 flex flex-col justify-between">
                         <div className="flex items-center justify-between text-[9px] font-mono text-industrial-gray border-b border-industrial-ink/10 pb-1">
                           <span className="font-bold">{p.id}</span>
@@ -1145,7 +1181,7 @@ export default function App() {
                         <div className="space-y-2 pt-2 border-t border-industrial-ink/20">
                           <span className="col-header">Where to actually go</span>
                           {lesson.relatedPassageIds.map(pid => {
-                            const passage: Passage | undefined = ALL_PASSAGES.find(x => x.id === pid);
+                            const passage: Passage | undefined = activePassages.value.find(x => x.id === pid);
                             if (!passage) return null;
                             return (
                               <div key={pid} className="p-2.5 border border-industrial-ink/30 bg-industrial-light/50">

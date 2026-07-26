@@ -11,3 +11,6 @@ pnpm-debug.log*
 .env
 .env.*
 !.env.example
+
+# Generated knowledge packs (built by `npm run bundles` during build)
+public/bundles/

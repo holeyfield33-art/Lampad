@@ -137,7 +137,7 @@ export class WorkerManager {
     mode: AppMode,
     onProgress: (chunk: string) => void,
     /** Retrieved passages with scores. The fallback engine answers from these. */
-    matches: Array<{ chunk: string; score: number; grounded?: boolean }> = []
+    matches: Array<{ chunk: string; score: number; grounded?: boolean; passage?: unknown }> = []
   ): Promise<{ text: string; hasDistress: boolean; safetyFlags: string[] }> {
     return this.sendRequest(
       this.inferenceWorker,

@@ -1,7 +1,11 @@
 import 'dotenv/config';
 import express from 'express';
+import { readFileSync, existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const app = express();
+const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 10000;
 
 // Where to forward received SOS packets (e.g. an alerting webhook). Optional:
@@ -61,6 +65,77 @@ app.use((req, res, next) => {
 });
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+
+// ---------------------------------------------------------------------------
+// Knowledge pack hub
+//
+// Packs are built from the repo by `npm run bundles` and served from disk, so a
+// deploy publishes them. Clients poll the manifest, compare digests, and pull
+// only what changed; ETags make an unchanged pack a 304 with no body, which
+// matters on a metered or intermittent connection.
+//
+// The digest is an integrity check, not an authenticity one: it is served by
+// the same host as the pack, so it protects against truncation and corruption,
+// not against this server being compromised. Authenticity needs the signed
+// bundles on the roadmap. The client validates pack contents independently for
+// that reason.
+// ---------------------------------------------------------------------------
+const BUNDLE_DIR = process.env.BUNDLE_DIR || join(__dirname, 'public', 'bundles');
+
+function readPack(name) {
+  const file = join(BUNDLE_DIR, `${name}.json`);
+  // `name` is matched against a strict allowlist pattern before it reaches
+  // here, but re-check the resolved path stays inside BUNDLE_DIR anyway.
+  if (!file.startsWith(BUNDLE_DIR) || !existsSync(file)) return null;
+  try {
+    return readFileSync(file, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+function serveJsonFile(req, res, body, weakTag) {
+  if (body === null) return res.status(404).json({ error: 'not_found' });
+  const etag = `"${weakTag}"`;
+  res.set('ETag', etag);
+  res.set('Cache-Control', 'public, max-age=300');
+  if (req.headers['if-none-match'] === etag) return res.status(304).end();
+  res.type('application/json').send(body);
+}
+
+let manifestCache = null;
+function manifest() {
+  if (manifestCache) return manifestCache;
+  const raw = readPack('manifest');
+  if (!raw) return null;
+  try {
+    manifestCache = { raw, parsed: JSON.parse(raw) };
+  } catch {
+    return null;
+  }
+  return manifestCache;
+}
+
+app.get('/api/bundles', (req, res) => {
+  const m = manifest();
+  if (!m) return res.status(503).json({ error: 'bundles_unavailable' });
+  const version = m.parsed.bundles.map(b => b.version).join('-');
+  serveJsonFile(req, res, m.raw, version);
+});
+
+app.get('/api/bundles/:id', (req, res) => {
+  const { id } = req.params;
+  // Allowlist: lowercase letters, digits and dashes only. Nothing that could
+  // walk out of the bundle directory.
+  if (!/^[a-z0-9-]{1,64}$/.test(id)) {
+    return res.status(400).json({ error: 'invalid_bundle_id' });
+  }
+  const m = manifest();
+  const entry = m?.parsed.bundles.find(b => b.id === id);
+  if (!entry) return res.status(404).json({ error: 'not_found' });
+  serveJsonFile(req, res, readPack(id), entry.version);
+});
+
 
 // Receives a queued SOS packet from the client once connectivity returns.
 // Only a 2xx response causes the client to mark the record delivered, so any

@@ -1,5 +1,6 @@
 import { CreateMLCEngine, MLCEngine, InitProgressReport } from '@mlc-ai/web-llm';
 import { WorkerRequest, WorkerResponse, AppMode } from '../types/worker.types';
+import { applyUpgrade, DB_NAME, DB_VERSION, SOS_STORE } from '../lib/db';
 import {
   answerFromRetrieval,
   answerLearnMode,
@@ -22,19 +23,14 @@ let useFallback = false;
 // Initialize IndexedDB helper
 function savePendingSOS(prompt: string, flags: string[]): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const request = indexedDB.open('AtlasBridgeDB', 1);
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
 
-    request.onupgradeneeded = (e: any) => {
-      const db = e.target.result;
-      if (!db.objectStoreNames.contains('pending_sos')) {
-        db.createObjectStore('pending_sos', { keyPath: 'id', autoIncrement: true });
-      }
-    };
+    request.onupgradeneeded = (e: any) => applyUpgrade(e.target.result);
 
     request.onsuccess = (e: any) => {
       const db = e.target.result;
-      const tx = db.transaction('pending_sos', 'readwrite');
-      const store = tx.objectStore('pending_sos');
+      const tx = db.transaction(SOS_STORE, 'readwrite');
+      const store = tx.objectStore(SOS_STORE);
       
       const sosRecord = {
         timestamp: new Date().toISOString(),
@@ -54,13 +50,8 @@ function savePendingSOS(prompt: string, flags: string[]): Promise<void> {
 
 // Ensure database stores exist on worker init
 function initDB() {
-  const request = indexedDB.open('AtlasBridgeDB', 1);
-  request.onupgradeneeded = (e: any) => {
-    const db = e.target.result;
-    if (!db.objectStoreNames.contains('pending_sos')) {
-      db.createObjectStore('pending_sos', { keyPath: 'id', autoIncrement: true });
-    }
-  };
+  const request = indexedDB.open(DB_NAME, DB_VERSION);
+  request.onupgradeneeded = (e: any) => applyUpgrade(e.target.result);
 }
 initDB();
 

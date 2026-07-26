@@ -113,7 +113,7 @@ misrepresenting it would be.
 | **Best Education & Opportunity** | MS admissions package, ~$2,000 | **Secondary.** 8 survival-English lessons, 4 languages, tied to the resource corpus. Real, but thinner than the immigration story. |
 | **Best Newcomer Settlement** | IKEA card, $100 | Qualifies. Low prize value; select it, don't build for it. |
 | **People's Choice** | $10,000 | Voted by attendees at the demo expo. This is the biggest prize and it rewards **demo quality**, not architecture. Offline mode is a great live demo: put the laptop in airplane mode on stage. |
-| **Best use of Render Workflows** | Render credits | ⚠️ **You do not currently qualify.** The prize requires **Render Workflows** specifically. This project uses a Render *static site* + a Render *node service* — different products. Either adopt Workflows deliberately or drop this track. |
+| **Best use of Render Workflows** | Render credits | ⚠️ **Still does not qualify.** The prize requires **Render Workflows** specifically. This project now uses Render for three things — static site, SOS API, and knowledge-pack hub — but none of them is Workflows. If you want this track, the natural fit is a Workflow that rebuilds and republishes packs on a schedule or on push, which is a real use of the product rather than a box-tick. |
 
 **Multiple track selection is allowed.** Select Immigration + Education +
 Settlement + People's Choice.

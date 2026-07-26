@@ -73,6 +73,31 @@ The remaining passages are marked `needs-review`: shown with a staleness caveat
 and a link, but not independently confirmed. `docs/DATA_REVIEW.md` tracks the
 sign-off.
 
+### Updating packs without shipping an app update
+
+Packs are published by the Render backend and pulled by the client:
+
+```
+npm run bundles          # build public/bundles/{manifest,county,immigration}.json
+GET /api/bundles         # manifest: id, version, sha256 digest, counts
+GET /api/bundles/:id     # one pack
+```
+
+The client compares digests, downloads only what changed, and revalidates with
+ETags — an unchanged pack is a 304 with no body, which matters on a metered
+connection. Packs are cached in IndexedDB, so a device that has synced once
+keeps its knowledge base offline. Git stays the source of truth; a deploy
+publishes.
+
+**Trust model.** The digest is an *integrity* check, not an *authenticity* one:
+it comes from the same host as the pack, so it catches corruption, not a
+compromised hub. The real defence is `validatePack` in `src/lib/bundleSync.ts`,
+which rejects any pack whose passages lack a source, carry a non-https URL,
+contain a fictional 555-01xx number, or exceed declared size bounds — and keeps
+the last good version when it does. Verified against a hub serving a
+correctly-digested malicious pack (`test/bundles.test.mjs`). Authenticity needs
+the signed bundles on the roadmap.
+
 ## Getting started
 
 ```bash
@@ -96,6 +121,8 @@ features need no configuration at all.
 | Variable | Used by | Purpose |
 | --- | --- | --- |
 | `VITE_SOS_ENDPOINT` | frontend (build time) | Where queued SOS packets are POSTed. Defaults to the hosted backend when unset. |
+| `VITE_BUNDLE_HUB` | frontend (build time) | Base URL of the knowledge-pack hub. Defaults to the hosted backend when unset. |
+| `BUNDLE_DIR` | `server.js` | Directory the hub serves packs from. Defaults to `public/bundles`. |
 | `PORT` | `server.js` | Port the SOS backend listens on. |
 | `SOS_FORWARD_URL` | `server.js` | Optional upstream webhook that received packets are forwarded to. |
 | `CORS_ORIGIN` | `server.js` | Allowed origin for the SOS API. Defaults to `*`. |
@@ -110,9 +137,14 @@ protect it — set `CORS_ORIGIN` and put it behind your own gateway if you point
 
 - **Signed knowledge bundles** (Ed25519) that the app verifies before trusting,
   so a bundle can be sideloaded onto a disconnected device and verified without a
-  network ("RAG over sneakernet").
+  network ("RAG over sneakernet"). The hub and the client validation gate are
+  built; what is missing is the signing key and the signature check, which
+  `verifyDigest` in `bundleSync.ts` is factored to sit beside.
 - **Publishing portal** for trusted orgs to author, sign, and update bundles.
-- **Delta-sync** so updates transfer as small diffs.
+  Today publishing is a git commit plus a deploy.
+- **Delta-sync** so updates transfer as small diffs. Today the client skips
+  unchanged packs entirely (digest comparison plus ETag revalidation) but
+  re-downloads a changed pack whole.
 
 ## Disclaimer
 

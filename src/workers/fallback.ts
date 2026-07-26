@@ -22,6 +22,17 @@ export interface RetrievedMatch {
   score: number;
   /** False when the lexical fallback matched without any shared vocabulary. */
   grounded?: boolean;
+  /**
+   * Provenance for this chunk, attached by the caller. Passages that arrived
+   * from the hub are not in this worker's compiled-in lookup, so the citation
+   * has to travel with the match or it would silently disappear.
+   */
+  passage?: {
+    source: string;
+    citation?: string;
+    url: string;
+    verifiedBy: 'primary-source' | 'needs-review';
+  };
 }
 
 export const REFUSAL =
@@ -47,7 +58,7 @@ function usableMatches(prompt: string, matches: RetrievedMatch[]): RetrievedMatc
 
 /** Render a retrieved passage plus the citation that makes it checkable. */
 function citeMatch(match: RetrievedMatch): string {
-  const passage = PASSAGE_BY_TEXT.get(match.chunk);
+  const passage = match.passage ?? PASSAGE_BY_TEXT.get(match.chunk);
   if (!passage) return match.chunk;
 
   const cite = passage.citation
