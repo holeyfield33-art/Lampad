@@ -2,22 +2,27 @@ services:
   # Frontend Web Application (AtlasBridge)
   - type: web
     name: lampad-atlasbridge
-    env: static
+    runtime: static
     buildCommand: npm run build
-    publishPath: dist
+    staticPublishPath: ./dist
+    # Header rules need a `path`; `name`/`value` are the header itself.
     headers:
-      - key: Cross-Origin-Opener-Policy
+      - path: /*
+        name: Cross-Origin-Opener-Policy
         value: same-origin
-      - key: Cross-Origin-Embedder-Policy
+      - path: /*
+        name: Cross-Origin-Embedder-Policy
         value: require-corp
 
   # Backend Webhook Mapping
   - type: web
     name: lampad-backend
-    env: node
+    runtime: node
     plan: free
     buildCommand: npm install
     startCommand: npm start
     envVars:
+      - key: NODE_ENV
+        value: production
       - key: PORT
         value: 10000

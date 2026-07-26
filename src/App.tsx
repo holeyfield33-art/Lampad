@@ -26,14 +26,28 @@ import {
   SOSRecord, 
   clearSyncedLogs 
 } from './lib/db';
-import { COUNTY_PASSAGES } from './data/passages';
+import { ALL_PASSAGES, BUNDLES, PASSAGE_BY_TEXT, type Passage } from './data';
+import { LESSONS, type Lesson } from './data/lessons';
+import { passagesOf, syncBundles } from './lib/bundleSync';
+
+// Endpoint that queued SOS packets are forwarded to once connectivity returns.
+// Documented in .env.example as VITE_SOS_ENDPOINT; falls back to the hosted
+// backend so an unconfigured build keeps the previous behaviour.
+const SOS_ENDPOINT =
+  (import.meta.env.VITE_SOS_ENDPOINT || '').trim() ||
+  'https://lampad-backend.onrender.com/api/sos';
+
+// Upper bound on a single prompt. Without it a large paste locks the input for
+// minutes while the fallback engine streams one chunk per word.
+const MAX_PROMPT_CHARS = 2000;
 
 // ==========================================
 // PREACT FINE-GRAINED STATE SIGNALS
 // ==========================================
 const currentMode = signal<AppMode>('INFO');
 const isOnline = signal<boolean>(navigator.onLine);
-const activeTab = signal<'CHAT' | 'RAG'>('CHAT');
+const activeTab = signal<'CHAT' | 'RAG' | 'LESSONS'>('CHAT');
+const openLessonId = signal<string>(LESSONS[0].id);
 
 // Load progress
 const isModelLoaded = signal<boolean>(false);
@@ -50,10 +64,18 @@ const retrievalPingMs = signal<number>(0);
 const pingTestPassed = signal<boolean>(false);
 const dbChunksCount = signal<number>(0);
 
+// Knowledge packs actually indexed this session. Starts as the packs compiled
+// into the app and is replaced by the merged set once the hub has been checked.
+const activePassages = signal(ALL_PASSAGES);
+/** Text -> passage, rebuilt whenever the indexed set changes. */
+const passageByText = () => new Map(activePassages.value.map(p => [p.text, p]));
+const bundleSyncStatus = signal<string>('built-in packs');
+
 // SOS sync state
 const pendingSosRecords = signal<SOSRecord[]>([]);
 const isSyncingSOS = signal<boolean>(false);
 const showSyncSuccessToast = signal<boolean>(false);
+const showSyncFailureToast = signal<boolean>(false);
 const showCelebrateToast = signal<boolean>(false);
 
 // Chat history state
@@ -77,7 +99,7 @@ const isGenerating = signal<boolean>(false);
 
 // Vector search test state
 const ragSearchQuery = signal<string>('');
-const ragSearchResults = signal<Array<{ chunk: string; score: number }>>([]);
+const ragSearchResults = signal<Array<{ chunk: string; score: number; grounded?: boolean }>>([]);
 const ragSearchLatency = signal<number>(0);
 
 // ==========================================
@@ -95,26 +117,34 @@ async function updateSOSState() {
 
 async function triggerAutomatedSync() {
   if (isSyncingSOS.value || !isOnline.value) return;
+  // Claim the lock before the first await: two concurrent callers (the online
+  // event and the isOnline effect) would otherwise both pass the guard and
+  // deliver every queued packet twice.
+  isSyncingSOS.value = true;
+
+  let delivered = 0;
+  let failed = 0;
 
   try {
     const db = await openDB();
     const unsynced = await getUnsyncedLogs(db);
 
     if (unsynced.length > 0) {
-      isSyncingSOS.value = true;
       console.log(`[Sync Engine] Found ${unsynced.length} unsynced emergency logs. Syncing...`);
 
       for (const log of unsynced) {
         try {
-          // Attempt post to Render backend SOS endpoint
-          const res = await fetch('https://lampad-backend.onrender.com/api/sos', {
+          // Attempt post to the configured SOS endpoint. The timeout keeps a
+          // hanging backend from stalling the whole queue indefinitely.
+          const res = await fetch(SOS_ENDPOINT, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               timestamp: log.timestamp,
               prompt: log.prompt,
               flags: log.flags
-            })
+            }),
+            signal: AbortSignal.timeout(15000)
           });
 
           if (res.ok) {
@@ -128,17 +158,30 @@ async function triggerAutomatedSync() {
               req.onsuccess = () => resolve();
               req.onerror = () => reject();
             });
+            delivered++;
           } else {
+            failed++;
             console.warn(`[Sync Engine] Backend returned ${res.status}; keeping log queued for retry.`);
           }
         } catch (postErr) {
+          failed++;
           console.warn('[Sync Engine] Backend unavailable, keeping offline logs armed:', postErr);
         }
       }
 
       await updateSOSState();
-      showSyncSuccessToast.value = true;
-      setTimeout(() => { showSyncSuccessToast.value = false; }, 4000);
+
+      // Only claim success for packets the backend actually accepted. Reporting
+      // "sync successful" after every attempt failed would tell someone in
+      // distress that help was notified when nothing left the device.
+      if (delivered > 0) {
+        showSyncSuccessToast.value = true;
+        setTimeout(() => { showSyncSuccessToast.value = false; }, 4000);
+      }
+      if (failed > 0) {
+        showSyncFailureToast.value = true;
+        setTimeout(() => { showSyncFailureToast.value = false; }, 6000);
+      }
     }
   } catch (err) {
     console.error('[Sync Engine] Sync failed:', err);
@@ -151,7 +194,9 @@ async function triggerAutomatedSync() {
 // CHAT GENERATION HANDLER
 // ==========================================
 async function handleSendMessage() {
-  const promptText = inputPrompt.value.trim();
+  // The input carries maxLength, but cap here too so a programmatic caller
+  // cannot hand the worker a prompt large enough to lock the UI for minutes.
+  const promptText = inputPrompt.value.trim().slice(0, MAX_PROMPT_CHARS);
   if (!promptText || isGenerating.value) return;
 
   const currentAppMode = currentMode.value;
@@ -185,9 +230,19 @@ async function handleSendMessage() {
   try {
     // 3. Step A: Context Retrieval (vector database cosine search)
     let contextStr = '';
+    let topMatches: Array<{ chunk: string; score: number; grounded?: boolean; passage?: unknown }> = [];
     if (currentAppMode === 'INFO') {
-      const topMatches = await workerManager.cosineSearch(promptText, 2);
-      if (topMatches && topMatches.length > 0) {
+      const found = (await workerManager.cosineSearch(promptText, 3)) || [];
+      // Attach provenance so the worker can cite passages it was never
+      // compiled with (anything that arrived from the hub).
+      const lookup = passageByText();
+      topMatches = found.map(m => {
+        const p = lookup.get(m.chunk);
+        return p
+          ? { ...m, passage: { source: p.source, citation: p.citation, url: p.url, verifiedBy: p.verifiedBy } }
+          : m;
+      });
+      if (topMatches.length > 0) {
         contextStr = topMatches.map(m => m.chunk).join('\n\n');
       }
     }
@@ -208,7 +263,8 @@ async function handleSendMessage() {
           }
           return msg;
         });
-      }
+      },
+      topMatches
     );
 
     const latency = parseFloat(((performance.now() - startTime) / 1000).toFixed(2));
@@ -287,9 +343,27 @@ export default function App() {
         });
         isEmbeddingLoaded.value = true;
 
-        // 2. Localized Compiler Workflow: Seed database text passages to Retrieval Worker
-        console.log('[Compiler] Seeding emergency and transit guide passages...');
-        const bundleInfo = await workerManager.vectorizeBundle(COUNTY_PASSAGES);
+        // 2. Pull any updated knowledge packs from the hub, then index whatever
+        // we ended up with. syncBundles never throws — offline or an
+        // unreachable hub just means the cached or built-in packs.
+        const sync = await syncBundles();
+        activePassages.value = passagesOf(sync.bundles);
+        bundleSyncStatus.value =
+          sync.status === 'updated'
+            ? `updated ${sync.updated.join(', ')}`
+            : sync.status === 'current'
+              ? 'packs up to date'
+              : sync.status === 'offline'
+                ? 'offline — using stored packs'
+                : 'hub unreachable — using stored packs';
+        if (sync.rejected.length > 0) {
+          bundleSyncStatus.value += ` (${sync.rejected.length} rejected)`;
+        }
+
+        console.log(`[Compiler] Indexing ${activePassages.value.length} passages...`);
+        const bundleInfo = await workerManager.vectorizeBundle(
+          activePassages.value.map(p => p.text)
+        );
         dbChunksCount.value = bundleInfo.count;
 
         // 3. Ping Verification Test (Ensure response under 5ms)
@@ -299,19 +373,31 @@ export default function App() {
         pingTestPassed.value = latencies.inferenceLatency < 5.0 && latencies.retrievalLatency < 5.0;
 
         // 4. Initialize Local inference engine (Web-LLM)
-        await workerManager.initInferenceEngine((progressReport: any) => {
+        const engineInfo = await workerManager.initInferenceEngine((progressReport: any) => {
           modelProgress.value = progressReport.progress;
           modelProgressText.value = progressReport.text;
-          
+
           if (progressReport.progress >= 1.0) {
-            isModelLoaded.value = true;
             showCelebrateToast.value = true;
             setTimeout(() => { showCelebrateToast.value = false; }, 5000);
           }
         });
 
+        // The engine is ready once INIT_ENGINE resolves. On devices without
+        // WebGPU (or when the weight download fails) the worker resolves
+        // straight into keyword-fallback mode without ever reporting 100%, and
+        // keying the loader panel off progress alone left it on screen forever.
+        isModelLoaded.value = true;
+        if (engineInfo?.fallback) {
+          modelProgress.value = 1;
+          modelProgressText.value = 'WebGPU unavailable — keyword fallback engine active';
+        }
+
       } catch (err) {
         console.error('[Initialization Error] System boot failed:', err);
+        isModelLoaded.value = true;
+        isEmbeddingLoaded.value = true;
+        modelProgressText.value = 'Engine init failed — running in fallback mode';
       }
     };
 
@@ -540,23 +626,29 @@ export default function App() {
             </div>
 
             <div className="mt-3 space-y-2">
-              <div className="p-2 border border-industrial-ink bg-industrial-paper">
-                <div className="flex justify-between items-center">
-                  <span className="font-mono text-[10px] font-bold">Emergency_Transit_SC</span>
-                  <span className="text-[10px] font-serif italic text-industrial-gray">V.1.2</span>
+              {BUNDLES.map(bundle => (
+                <div key={bundle.id} className="p-2 border border-industrial-ink bg-industrial-paper">
+                  <div className="flex justify-between items-center">
+                    <span className="font-mono text-[10px] font-bold">{bundle.title}</span>
+                    <span className="text-[10px] font-serif italic text-industrial-gray">
+                      {bundle.passages.length} chunks
+                    </span>
+                  </div>
+                  <p className="text-[10px] text-industrial-ink/70 mt-1 leading-normal font-sans">
+                    {bundle.description}
+                  </p>
+                  <p className="text-[9px] text-industrial-gray mt-1 font-mono uppercase tracking-wide">
+                    {bundle.authority}
+                  </p>
                 </div>
-                <p className="text-[10px] text-industrial-ink/70 mt-1 leading-normal font-sans">
-                  Santa Clara County Emergency Services & Transit Map ({dbChunksCount.value} vector chunks)
-                </p>
-              </div>
-
-              <div className="p-2 border border-dashed border-industrial-ink opacity-40 bg-industrial-light/40">
-                <div className="flex justify-between items-center">
-                  <span className="font-mono text-[10px] font-bold">Legal_Aid_Immigration</span>
-                  <span className="text-[10px] font-serif italic">V.0.9</span>
-                </div>
-                <p className="text-[10px] mt-0.5 font-sans">Available in extended release</p>
-              </div>
+              ))}
+              <p className="text-[10px] text-industrial-ink/60 font-sans leading-normal pt-1">
+                {dbChunksCount.value} of {activePassages.value.length} passages indexed. Every answer
+                cites the passage it came from.
+                <span className="block font-mono text-[9px] uppercase tracking-wide mt-1 opacity-70">
+                  Hub: {bundleSyncStatus.value}
+                </span>
+              </p>
             </div>
           </div>
 
@@ -580,7 +672,8 @@ export default function App() {
             </div>
 
             <p className="text-[11px] text-industrial-ink/75 leading-relaxed font-sans mb-3">
-              Secure native IndexedDB store tracks and logs critical distress incidents offline. Syncs with backend automatically when connection recovers.
+              Distress incidents are stored in this browser's IndexedDB while offline. When connectivity returns, each
+              pending record — including the prompt text that triggered it — is sent to the configured SOS endpoint.
             </p>
 
             {/* SOS List Container */}
@@ -668,6 +761,16 @@ export default function App() {
             >
               02. VECTOR_DIAGNOSTICS
             </button>
+            <button
+              onClick={() => activeTab.value = 'LESSONS'}
+              className={`px-5 md:px-6 py-3 border-r border-industrial-ink font-mono text-xs font-bold transition-all ${
+                activeTab.value === 'LESSONS'
+                  ? 'bg-industrial-ink text-industrial-bg'
+                  : 'bg-industrial-paper text-industrial-ink hover:bg-industrial-light opacity-60 hover:opacity-100'
+              }`}
+            >
+              03. ENGLISH_LESSONS
+            </button>
             <div className="ml-auto px-4 flex items-center">
               {isSyncingSOS.value && (
                 <div className="flex items-center gap-1.5 text-[10px] font-mono text-industrial-accent">
@@ -683,7 +786,9 @@ export default function App() {
             <div className="flex-1 flex flex-col justify-between overflow-hidden p-3 md:p-6">
               
               {/* Chat Viewport (Plain industrial paper printout look) */}
-              <div className="flex-1 bg-industrial-paper border border-industrial-ink p-4 font-mono text-xs overflow-y-auto flex flex-col space-y-4">
+              {/* select-text: the shell sets select-none, but hotline numbers
+                  in the answers have to be selectable and copyable. */}
+              <div className="flex-1 bg-industrial-paper border border-industrial-ink p-4 font-mono text-xs overflow-y-auto flex flex-col space-y-4 select-text">
                 
                 {/* Initial Welcome Printout */}
                 <div className="flex gap-4 items-start border-b border-industrial-ink/10 pb-3">
@@ -777,6 +882,7 @@ export default function App() {
                   <input
                     type="text"
                     value={inputPrompt.value}
+                    maxLength={MAX_PROMPT_CHARS}
                     onInput={(e) => inputPrompt.value = (e.target as HTMLInputElement).value}
                     placeholder={
                       currentMode.value === 'INFO'
@@ -879,8 +985,14 @@ export default function App() {
                           >
                             <span className="font-bold">#MATCH-0{index + 1}</span>
                             <span className="truncate pr-4 font-sans font-medium italic">"{res.chunk}"</span>
-                            <span className="opacity-75 font-mono">EMG_TRANS</span>
-                            <span className="font-bold text-industrial-accent">[ {res.score.toFixed(4)} ]</span>
+                            <span className="opacity-75 font-mono text-[9px] leading-tight">
+                              {passageByText().get(res.chunk)?.citation
+                                || passageByText().get(res.chunk)?.source
+                                || 'UNSOURCED'}
+                            </span>
+                            <span className={`font-bold ${res.grounded === false ? 'text-industrial-warning' : 'text-industrial-accent'}`}>
+                              [ {res.score.toFixed(4)} ]{res.grounded === false ? ' ✕' : ''}
+                            </span>
                           </div>
                         ))}
                       </div>
@@ -890,18 +1002,27 @@ export default function App() {
 
                 {/* 2. Entire knowledge database printout */}
                 <div className="space-y-3 pt-4 border-t border-industrial-ink/20">
-                  <span className="col-header">Full Seeded Transit & Clinic Database Chunks ({COUNTY_PASSAGES.length})</span>
+                  <span className="col-header">Indexed knowledge base ({activePassages.value.length} passages, all cited)</span>
                   
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    {COUNTY_PASSAGES.map((p, index) => (
+                    {activePassages.value.map((p, index) => (
                       <div key={index} className="p-3 bg-industrial-paper border border-industrial-ink/50 hover:border-industrial-ink transition text-xs space-y-1.5 flex flex-col justify-between">
                         <div className="flex items-center justify-between text-[9px] font-mono text-industrial-gray border-b border-industrial-ink/10 pb-1">
-                          <span className="font-bold">ID: COUNTY_PASSAGE_0{index + 1}</span>
+                          <span className="font-bold">{p.id}</span>
                           <span className="uppercase">FP32 Vector Dimension [384]</span>
                         </div>
                         <p className="text-industrial-ink/85 leading-relaxed font-sans line-clamp-3 hover:line-clamp-none transition-all cursor-pointer font-medium mt-1">
-                          {p}
+                          {p.text}
                         </p>
+                        <a
+                          href={p.url}
+                          target="_blank"
+                          rel="noreferrer noopener"
+                          className="text-[9px] font-mono text-industrial-accent hover:underline break-all block pt-1 border-t border-industrial-ink/10"
+                        >
+                          {p.citation || p.source}
+                          {p.verifiedBy === 'needs-review' ? ' (needs review)' : ' (primary source)'}
+                        </a>
                       </div>
                     ))}
                   </div>
@@ -909,6 +1030,179 @@ export default function App() {
 
               </div>
 
+            </div>
+          )}
+
+
+          {/* TAB 3: OFFLINE ENGLISH LESSON PACK */}
+          {activeTab.value === 'LESSONS' && (
+            <div className="flex-1 flex flex-col lg:flex-row overflow-hidden">
+
+              {/* Lesson index */}
+              <div className="w-full lg:w-64 border-b lg:border-b-0 lg:border-r border-industrial-ink bg-industrial-paper overflow-y-auto shrink-0">
+                <div className="p-3 border-b border-industrial-ink bg-industrial-light">
+                  <span className="col-header">Survival English ({LESSONS.length})</span>
+                  <p className="text-[10px] text-industrial-ink/70 font-sans leading-normal mt-1">
+                    Phrasebook and grammar for the conversations that come first. Works offline.
+                  </p>
+                </div>
+                {LESSONS.map(lesson => (
+                  <button
+                    key={lesson.id}
+                    onClick={() => openLessonId.value = lesson.id}
+                    className={`w-full text-left p-3 border-b border-industrial-ink/15 transition ${
+                      openLessonId.value === lesson.id
+                        ? 'bg-industrial-ink text-industrial-bg'
+                        : 'hover:bg-industrial-light'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-sans text-xs font-bold">{lesson.title}</span>
+                      <span className={`font-mono text-[9px] px-1 py-0.5 border ${
+                        openLessonId.value === lesson.id
+                          ? 'border-industrial-bg/40'
+                          : 'border-industrial-ink/30 text-industrial-gray'
+                      }`}>
+                        {lesson.level}
+                      </span>
+                    </div>
+                    <p className={`text-[10px] font-sans leading-snug mt-1 ${
+                      openLessonId.value === lesson.id ? 'opacity-80' : 'text-industrial-ink/60'
+                    }`}>
+                      {lesson.scenario}
+                    </p>
+                  </button>
+                ))}
+              </div>
+
+              {/* Lesson detail */}
+              <div className="flex-1 overflow-y-auto p-4 md:p-6 select-text">
+                {(() => {
+                  const lesson: Lesson = LESSONS.find(l => l.id === openLessonId.value) || LESSONS[0];
+                  return (
+                    <div className="max-w-3xl space-y-6">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <BookOpen className="w-5 h-5 text-industrial-accent" />
+                          <h3 className="text-sm font-bold uppercase tracking-widest">{lesson.title}</h3>
+                          <span className="font-mono text-[10px] border border-industrial-ink px-1.5 py-0.5">
+                            {lesson.level}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-industrial-gray mt-2 font-sans leading-relaxed">
+                          <strong>When:</strong> {lesson.scenario}<br />
+                          <strong>Goal:</strong> {lesson.objective}
+                        </p>
+                      </div>
+
+                      <div className="space-y-2">
+                        <span className="col-header">Vocabulary</span>
+                        <div className="border border-industrial-ink bg-industrial-paper divide-y divide-industrial-ink/15">
+                          <div className="grid grid-cols-[1.2fr_1fr_1fr_1fr] p-2 bg-industrial-light">
+                            <div className="col-header">English</div>
+                            <div className="col-header">Español</div>
+                            <div className="col-header">中文</div>
+                            <div className="col-header">Tiếng Việt</div>
+                          </div>
+                          {lesson.vocabulary.map(term => (
+                            <div key={term.en} className="grid grid-cols-[1.2fr_1fr_1fr_1fr] p-2 text-xs font-sans gap-2">
+                              <div>
+                                <span className="font-bold">{term.en}</span>
+                                {term.note && (
+                                  <span className="block text-[10px] text-industrial-gray italic mt-0.5">{term.note}</span>
+                                )}
+                              </div>
+                              <div>{term.es}</div>
+                              <div>{term.zh}</div>
+                              <div>{term.vi}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="space-y-2">
+                        <span className="col-header">Phrases you can use today</span>
+                        <div className="space-y-2">
+                          {lesson.phrases.map(phrase => (
+                            <div key={phrase.en} className="p-2.5 border border-industrial-ink/40 bg-industrial-paper">
+                              <p className="font-sans text-sm font-semibold">"{phrase.en}"</p>
+                              <p className="font-sans text-[11px] text-industrial-ink/70 mt-1 leading-relaxed">
+                                {phrase.es} &nbsp;·&nbsp; {phrase.zh} &nbsp;·&nbsp; {phrase.vi}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="space-y-2">
+                        <span className="col-header">Practice dialogue</span>
+                        <div className="border border-industrial-ink bg-industrial-paper p-3 space-y-1.5">
+                          {lesson.dialogue.map((turn, i) => (
+                            <p key={i} className="text-xs font-sans">
+                              <span className="font-mono font-bold text-industrial-accent">{turn.speaker}:</span>{' '}
+                              {turn.line}
+                            </p>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="space-y-2">
+                        <span className="col-header">Grammar — {lesson.grammar.point}</span>
+                        <p className="text-xs font-sans leading-relaxed text-industrial-ink/85">
+                          {lesson.grammar.explanation}
+                        </p>
+                        <ul className="space-y-1">
+                          {lesson.grammar.examples.map(ex => (
+                            <li key={ex} className="text-xs font-sans list-disc ml-5">{ex}</li>
+                          ))}
+                        </ul>
+                      </div>
+
+                      <div className="space-y-2">
+                        <span className="col-header">Try it yourself</span>
+                        <ul className="space-y-1">
+                          {lesson.practice.map(item => (
+                            <li key={item} className="text-xs font-sans list-disc ml-5">{item}</li>
+                          ))}
+                        </ul>
+                        <button
+                          onClick={() => {
+                            currentMode.value = 'LEARN';
+                            activeTab.value = 'CHAT';
+                            inputPrompt.value = lesson.practice[0];
+                          }}
+                          className="mt-2 bg-industrial-ink hover:bg-industrial-accent text-industrial-bg font-mono text-[10px] font-bold px-3 py-2 uppercase transition"
+                        >
+                          Practise this with the tutor
+                        </button>
+                      </div>
+
+                      {lesson.relatedPassageIds.length > 0 && (
+                        <div className="space-y-2 pt-2 border-t border-industrial-ink/20">
+                          <span className="col-header">Where to actually go</span>
+                          {lesson.relatedPassageIds.map(pid => {
+                            const passage: Passage | undefined = activePassages.value.find(x => x.id === pid);
+                            if (!passage) return null;
+                            return (
+                              <div key={pid} className="p-2.5 border border-industrial-ink/30 bg-industrial-light/50">
+                                <p className="text-[11px] font-sans leading-relaxed">{passage.text}</p>
+                                <a
+                                  href={passage.url}
+                                  target="_blank"
+                                  rel="noreferrer noopener"
+                                  className="text-[9px] font-mono text-industrial-accent hover:underline break-all block mt-1.5"
+                                >
+                                  {passage.citation || passage.source}
+                                </a>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
             </div>
           )}
 
@@ -959,7 +1253,23 @@ export default function App() {
           <div className="space-y-1">
             <h4 className="text-xs font-bold uppercase tracking-wider font-mono">SOS Log Sync Successful</h4>
             <p className="text-[11px] text-industrial-ink/80 leading-normal font-sans font-medium">
-              Connection restabilized. Encrypted emergency incident logs synced securely to remote responders.
+              Connection restabilized. Queued incident logs were accepted by the configured SOS endpoint.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* 3. Sync failure notice — the queue is still armed, nothing was delivered */}
+      {showSyncFailureToast.value && (
+        <div id="sync-failure-toast" className="fixed bottom-28 right-6 bg-industrial-paper border-2 border-industrial-warning shadow-2xl p-4 flex items-start gap-3 max-w-sm z-50 text-industrial-ink">
+          <div className="bg-industrial-warning text-white p-2 border border-industrial-ink shrink-0">
+            <AlertTriangle className="w-5 h-5" />
+          </div>
+          <div className="space-y-1">
+            <h4 className="text-xs font-bold uppercase tracking-wider font-mono">SOS Sync Failed</h4>
+            <p className="text-[11px] text-industrial-ink/80 leading-normal font-sans font-medium">
+              The SOS endpoint could not be reached. Your incident logs are still stored on this device and remain
+              queued for retry — nobody has been notified yet.
             </p>
           </div>
         </div>
