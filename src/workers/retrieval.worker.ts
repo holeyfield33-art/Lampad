@@ -1,5 +1,12 @@
 import { pipeline } from '@xenova/transformers';
 import { WorkerRequest, WorkerResponse } from '../types/worker.types';
+import {
+  buildIdf,
+  cosineSimilarity,
+  hasContentOverlap,
+  lexicalEmbedding,
+  type Idf,
+} from '../lib/text';
 
 let extractor: any = null;
 let useFallback = false;
@@ -10,61 +17,20 @@ interface Document {
 }
 
 let database: Document[] = [];
+/** IDF weights over the indexed corpus; only used by the lexical fallback. */
+let idf: Idf | undefined;
 
 /**
- * High-performance Fallback Vectorizer: Token-Hashing & Normalization
- * Generates a stable 384-dimensional unit vector based on text content.
- * Dot products of these vectors correspond directly to token overlap.
+ * Lexical fallback vectoriser, used when the MiniLM model cannot be loaded.
+ *
+ * Delegates to `lib/text`, which is IDF-weighted, stopword-filtered and uses
+ * signed feature hashing. The previous implementation accumulated raw positive
+ * token counts, which made similarity a measure of stopword overlap: an
+ * off-topic question scored higher than most on-topic ones. See
+ * test/retrieval.test.mjs for the measured behaviour.
  */
 function generateFallbackEmbedding(text: string): Float32Array {
-  const vector = new Float32Array(384);
-  const clean = text.toLowerCase().replace(/[^a-z0-9\s]/g, '');
-  const tokens = clean.split(/\s+/).filter(t => t.length > 1);
-
-  if (tokens.length === 0) {
-    // Return unit constant vector
-    const val = 1.0 / Math.sqrt(384);
-    vector.fill(val);
-    return vector;
-  }
-
-  // Hash each token to an index in [0, 383] and accumulate weights
-  for (const token of tokens) {
-    let hash = 0;
-    for (let i = 0; i < token.length; i++) {
-      hash = (hash << 5) - hash + token.charCodeAt(i);
-      hash |= 0; // Convert to 32bit integer
-    }
-    const idx = Math.abs(hash) % 384;
-    vector[idx] += 1.0;
-  }
-
-  // Calculate magnitude and normalize to unit length
-  let sumSq = 0;
-  for (let i = 0; i < 384; i++) {
-    sumSq += vector[i] * vector[i];
-  }
-  const mag = Math.sqrt(sumSq);
-
-  if (mag > 0) {
-    for (let i = 0; i < 384; i++) {
-      vector[i] /= mag;
-    }
-  }
-
-  return vector;
-}
-
-/**
- * Calculates dot product between two normalized vectors (Cosine Similarity)
- */
-function cosineSimilarity(a: Float32Array, b: Float32Array): number {
-  let dot = 0;
-  const len = a.length;
-  for (let i = 0; i < len; i++) {
-    dot += a[i] * b[i];
-  }
-  return dot;
+  return lexicalEmbedding(text, idf);
 }
 
 self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
@@ -100,7 +66,7 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
 
       self.postMessage({ id, type, status: 'SUCCESS', payload: { fallback: false } });
     } catch (err: any) {
-      console.warn('Transformer loading failed, running high-performance Token-Hashing Fallback:', err);
+      console.warn('Transformer model unavailable; using the lexical keyword fallback (degraded retrieval quality):', err);
       useFallback = true;
       self.postMessage({ id, type, status: 'SUCCESS', payload: { fallback: true, error: err.message } });
     }
@@ -112,6 +78,10 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
 
     try {
       database = [];
+      // IDF is computed over the corpus being indexed, so rare, meaningful
+      // terms ("notario", "OPT", "Here4You") outweigh common ones. Only the
+      // lexical fallback consults it.
+      idf = buildIdf(chunks);
 
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
@@ -154,14 +124,16 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
     const { query, topK } = payload as { query: string; topK: number };
 
     try {
-      if (database.length === 0) {
+      if (typeof query !== 'string' || query.trim() === '' || database.length === 0) {
         self.postMessage({ id, type, status: 'SUCCESS', payload: [] });
         return;
       }
 
+      const usingLexicalFallback = useFallback || !extractor;
+
       // Generate query embedding
       let queryVec: Float32Array;
-      if (useFallback || !extractor) {
+      if (usingLexicalFallback) {
         queryVec = generateFallbackEmbedding(query);
       } else {
         const output = await extractor(query, { pooling: 'mean', normalize: true });
@@ -171,23 +143,25 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
       // Measure search performance
       const t0 = performance.now();
 
-      // Scan and calculate similarity
-      const results = database.map(doc => {
-        const score = cosineSimilarity(queryVec, doc.embedding);
-        return {
-          chunk: doc.chunk,
-          score: parseFloat(score.toFixed(4))
-        };
-      });
+      const results = database.map(doc => ({
+        chunk: doc.chunk,
+        score: parseFloat(cosineSimilarity(queryVec, doc.embedding).toFixed(4)),
+        // A lexical matcher always returns a nearest neighbour, however
+        // unrelated. Flag whether the query and passage actually share
+        // vocabulary so the caller can refuse instead of answering from a
+        // passage that merely won a similarity contest among 18 candidates.
+        grounded: usingLexicalFallback ? hasContentOverlap(query, doc.chunk) : true,
+      }));
 
-      // Sort by descending score
       results.sort((a, b) => b.score - a.score);
 
       const topResults = results.slice(0, topK);
       const scanTime = performance.now() - t0;
 
-      // Log latency diagnostics
-      console.log(`[Retrieval Worker] Cosine search complete in ${scanTime.toFixed(2)}ms for ${database.length} chunks.`);
+      console.log(
+        `[Retrieval Worker] Cosine search complete in ${scanTime.toFixed(2)}ms for ${database.length} chunks` +
+        `${usingLexicalFallback ? ' (lexical fallback)' : ''}.`
+      );
 
       self.postMessage({
         id,

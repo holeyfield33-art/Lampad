@@ -10,7 +10,7 @@
     "start": "node server.js",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "test": "node --test test/server.test.mjs test/build.test.mjs test/content.test.mjs",
+    "test": "node --test test/server.test.mjs test/build.test.mjs test/content.test.mjs test/data.test.mjs test/retrieval.test.mjs test/fallback.test.mjs",
     "test:e2e": "VITE_SOS_ENDPOINT=http://127.0.0.1:10601/api/sos vite build && node --test --test-concurrency=1 test/frontend.e2e.mjs"
   },
   "dependencies": {

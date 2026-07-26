@@ -135,12 +135,14 @@ export class WorkerManager {
     prompt: string,
     context: string,
     mode: AppMode,
-    onProgress: (chunk: string) => void
+    onProgress: (chunk: string) => void,
+    /** Retrieved passages with scores. The fallback engine answers from these. */
+    matches: Array<{ chunk: string; score: number; grounded?: boolean }> = []
   ): Promise<{ text: string; hasDistress: boolean; safetyFlags: string[] }> {
     return this.sendRequest(
       this.inferenceWorker,
       'GENERATE',
-      { prompt, context, mode },
+      { prompt, context, mode, matches },
       onProgress
     );
   }
@@ -165,7 +167,7 @@ export class WorkerManager {
   public cosineSearch(
     query: string,
     topK: number = 3
-  ): Promise<Array<{ chunk: string; score: number }>> {
+  ): Promise<Array<{ chunk: string; score: number; grounded?: boolean }>> {
     return this.sendRequest(this.retrievalWorker, 'COSINE_SEARCH', { query, topK });
   }
 

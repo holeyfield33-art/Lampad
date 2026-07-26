@@ -16,11 +16,14 @@ retrieval queries, and model output never leave the device.
 ## What it does
 
 - **Survival Info (grounded chat).** Answers questions about local emergency,
-  housing, health, transit, food, and document-safety resources using only
-  retrieved local context. If nothing relevant is found, it refuses rather than
-  inventing an answer.
-- **English Tutor.** Provides translation aids, grammar notes, and practice
-  prompts for newcomers.
+  housing, health, transit, food, schooling, worker rights, and US visa status
+  using only retrieved context, and cites the passage every answer came from. If
+  nothing relevant is retrieved, it refuses rather than inventing an answer.
+- **English Tutor.** Eight survival-English lessons — calling 911, a clinic
+  visit, a landlord, a pay dispute, an immigration appointment — with
+  vocabulary and phrases in Spanish, Chinese and Vietnamese, a practice
+  dialogue, a grammar point, and a link to the resource passage for the same
+  situation.
 - **Offline SOS queue.** A keyword distress scanner flags dangerous situations
   and stores a packet in IndexedDB, forwarding it to the configured backend
   automatically once connectivity returns. A packet is only marked delivered on
@@ -35,9 +38,40 @@ Two dedicated Web Workers, coordinated by a typed message protocol:
 | `inference.worker.ts` | `@mlc-ai/web-llm` | Runs `Qwen2.5-0.5B-Instruct` (q4f16) locally via WebGPU |
 | `retrieval.worker.ts` | `@xenova/transformers` | Embeds text with `paraphrase-multilingual-MiniLM-L12-v2` for in-browser RAG |
 
-Both workers degrade gracefully: without WebGPU the inference worker uses a
-keyword fallback, and the retrieval worker falls back to a token-hashing
-embedder, so the app still runs on low-capability devices.
+Both workers degrade gracefully, and the degraded path is the one most devices
+actually take — Safari and Firefox have no WebGPU, and the first run of a fresh
+install has no cached weights.
+
+- **Without WebGPU**, the inference worker answers *from retrieval*: it receives
+  the scored passages the embedding model selected and assembles the reply from
+  them, with citations. It does not fall back to canned text.
+- **Without the embedding model**, retrieval uses a lexical embedder — IDF
+  weighted over the indexed corpus, stopword filtered, character trigrams,
+  signed feature hashing. On a 10-query labelled set it scores 100% top-1
+  (`npm test` → `test/retrieval.test.mjs`).
+- **In either fallback**, a question that shares no vocabulary with any passage
+  is refused rather than answered from the nearest neighbour.
+
+## Knowledge base
+
+18 passages across two bundles, every one carrying its source, a link, and a
+verification date.
+
+| Bundle | Passages | Authority |
+| --- | --- | --- |
+| Santa Clara County survival guide | 8 | County and city service providers |
+| US visa & work authorization | 10 | Title 8, Code of Federal Regulations |
+
+Eight of the immigration passages are plain-language restatements of regulation
+text stored verbatim in `src/data/sources/cfr-excerpts.json`, pulled from the
+eCFR API. `test/data.test.mjs` checks that each cited excerpt exists and that
+the numbers the summary asserts — "at least three of eight" for O-1A, "three of
+ten" for EB-1A, "not to exceed 3 years", "24-month extension" — actually appear
+in the regulation, so the summary cannot drift from the source.
+
+The remaining passages are marked `needs-review`: shown with a staleness caveat
+and a link, but not independently confirmed. `docs/DATA_REVIEW.md` tracks the
+sign-off.
 
 ## Getting started
 
