@@ -29,9 +29,32 @@ export class WorkerManager {
 
       this.inferenceWorker.addEventListener('message', (e) => this.handleMessage(e.data));
       this.retrievalWorker.addEventListener('message', (e) => this.handleMessage(e.data));
+
+      // A worker that dies (uncaught error, OOM, unstructured-cloneable reply)
+      // never answers its request. Without this, every in-flight promise hangs
+      // forever and the UI stays stuck on "generating" with no error shown.
+      for (const [name, worker] of [
+        ['inference', this.inferenceWorker],
+        ['retrieval', this.retrievalWorker],
+      ] as Array<[string, Worker]>) {
+        worker.addEventListener('error', (e: ErrorEvent) => {
+          this.rejectAllPending(new Error(`${name} worker crashed: ${e.message || 'unknown error'}`));
+        });
+        worker.addEventListener('messageerror', () => {
+          this.rejectAllPending(new Error(`${name} worker sent an undeserializable message`));
+        });
+      }
     } catch (error) {
       console.error('Failed to initialize workers:', error);
     }
+  }
+
+  private rejectAllPending(err: Error) {
+    console.error('[WorkerManager]', err.message);
+    for (const deferred of this.promises.values()) {
+      deferred.reject(err);
+    }
+    this.promises.clear();
   }
 
   private handleMessage(data: WorkerResponse) {
@@ -99,7 +122,9 @@ export class WorkerManager {
   /**
    * Triggers loading of Qwen2.5 MLC Engine inside the inference worker
    */
-  public initInferenceEngine(onProgress: (progress: any) => void): Promise<void> {
+  public initInferenceEngine(
+    onProgress: (progress: any) => void
+  ): Promise<{ fallback?: boolean; gpuSupported?: boolean; error?: string }> {
     return this.sendRequest(this.inferenceWorker, 'INIT_ENGINE', null, onProgress);
   }
 

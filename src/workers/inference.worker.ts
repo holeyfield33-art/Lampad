@@ -4,6 +4,12 @@ import { WorkerRequest, WorkerResponse, AppMode } from '../types/worker.types';
 // Regex for scanning distress terms
 const DISTRESS_REGEX = /\b(passport|locked in|confiscated|withheld|threatened|escape|police|abuse|forced to work|cannot leave|unpaid|debt bondage|trafficking|dangerous|save me|emergency|sos|held against my will|stolen passport)\b/gi;
 
+// Mirrors MAX_PROMPT_CHARS in App.tsx: the worker must not depend on the UI
+// having enforced the cap.
+const MAX_PROMPT_CHARS = 2000;
+// Upper bound on simulated streaming chunks in the fallback engine.
+const MAX_STREAM_CHUNKS = 400;
+
 let engine: MLCEngine | null = null;
 let useFallback = false;
 
@@ -102,11 +108,11 @@ async function generateFallback(
     } else {
       // Build responses grounded in our county context
       if (lowercasePrompt.includes('emergency') || lowercasePrompt.includes('police') || lowercasePrompt.includes('help')) {
-        fullResponse = `**Santa Clara County Emergency Grounded Information:**\n\nFor any immediate threat to life or safety, dial **911** directly. \n\n*   **Milpitas Police Department:** Non-emergency dispatch can be reached at **(408) 586-2400** (located at 1275 N Milpitas Blvd).\n*   **County Distress/Crisis Hotline:** Call or text **988** for immediate mental health support.\n*   **Newcomer Crisis Center:** Call **(408) 555-0199** for localized support regarding housing and basic security assistance. All services are confidential and multilingual.`;
+        fullResponse = `**Santa Clara County Emergency Grounded Information:**\n\nFor any immediate threat to life or safety, dial **911** directly. \n\n*   **Milpitas Police Department:** Non-emergency dispatch can be reached at **(408) 586-2400** (located at 1275 N Milpitas Blvd).\n*   **County Distress/Crisis Hotline:** Call or text **988** for immediate mental health support.\n*   **Free legal services:** Available to newcomers through the confidential County Support network. All services are confidential and multilingual.`;
       } else if (lowercasePrompt.includes('transit') || lowercasePrompt.includes('bus') || lowercasePrompt.includes('vta')) {
         fullResponse = `**Milpitas/Santa Clara Transit Grounded Guide:**\n\n*   **VTA (Santa Clara Valley Transportation Authority):** Offers comprehensive bus and light rail networks across Milpitas and San Jose. The **VTA Orange Line** directly serves the Milpitas Transit Center.\n*   **BART Connection:** The Milpitas BART station connects newcomers directly to Oakland and San Francisco. \n*   **VTA ACCESS:** Paratransit services are available for individuals with physical or cognitive challenges. Call VTA customer service at **(408) 321-2300** to apply for discounted transit fares (Clipper START program).`;
       } else if (lowercasePrompt.includes('shelter') || lowercasePrompt.includes('housing')) {
-        fullResponse = `**County Housing Support Options:**\n\n*   **Here4You Hotline:** Call **(408) 385-2400** (open daily 9 AM - 7 PM) to find emergency shelter vacancies and rental assistance options within Santa Clara County.\n*   **Milpitas Family Shelter:** Located in north county, providing temporary housing and food vouchers. \n*   **Tenant Protection:** Landlords in Milpitas cannot evict you without just cause. For free legal counsel regarding tenant rights, call the Bay Area Legal Aid hotline at **(800) 551-5554**.`;
+        fullResponse = `**County Housing Support Options:**\n\n*   **Here4You Hotline:** Call **(408) 385-2400** (open daily 9 AM - 7 PM) to find emergency shelter vacancies and rental assistance options within Santa Clara County.\n*   **Tenant Protection:** Landlords in Milpitas cannot evict you without just cause. For free legal counsel regarding tenant rights, call the Bay Area Legal Aid hotline at **(800) 551-5554**.`;
       } else if (lowercasePrompt.includes('clinic') || lowercasePrompt.includes('medical') || lowercasePrompt.includes('hospital')) {
         fullResponse = `**Local Healthcare Resources:**\n\n*   **Santa Clara Valley Medical Center (VMC):** Offers high-quality, subsidized medical care regardless of legal status. Locate the Milpitas Clinic at **143 N Main St, Milpitas, CA** or call **(408) 957-0900**.\n*   **Community Health Hotlines:** Call **211** for free health enrollment support. You may be eligible for Medi-Cal or Primary Care Access Program (PCAP).`;
       } else {
@@ -116,8 +122,9 @@ async function generateFallback(
       }
     }
   } else {
-    // LEARN mode: English tutor with corrections and Learning Corner
-    const cleanPrompt = prompt.trim();
+    // LEARN mode: English tutor with corrections and Learning Corner.
+    // The prompt is echoed back, so bound it before it lands in the response.
+    const cleanPrompt = prompt.trim().slice(0, MAX_PROMPT_CHARS);
     fullResponse = `Hello! It is wonderful to chat with you today. Your sentence was: "${cleanPrompt}". 
 
 I would love to help you practice your English. In a professional or casual environment, expressing yourself clearly helps you establish strong connections. 
@@ -139,15 +146,18 @@ Here is some conversational encouragement: Always try to speak in full sentences
 *   *Adverb*: "directly" (Modifies the verb "serves" to indicate a direct connection).`;
   }
 
-  // Simulate streaming by splitting into chunks
+  // Simulate streaming by splitting into chunks. The per-word delay is capped
+  // by MAX_STREAM_CHUNKS: a long response would otherwise hold the input
+  // disabled for minutes at ~10ms per word before the remainder is flushed.
   const words = fullResponse.split(' ');
-  let currentText = '';
-  for (let i = 0; i < words.length; i++) {
-    const chunk = words[i] + ' ';
-    currentText += chunk;
-    onProgress(chunk);
+  const streamed = words.slice(0, MAX_STREAM_CHUNKS);
+  for (let i = 0; i < streamed.length; i++) {
+    onProgress(streamed[i] + ' ');
     // Standard delay to simulate streaming beautifully
     await new Promise(resolve => setTimeout(resolve, Math.max(10, 40 - Math.min(20, i))));
+  }
+  if (words.length > streamed.length) {
+    onProgress(words.slice(streamed.length).join(' '));
   }
 
   return fullResponse;
@@ -203,7 +213,11 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
   }
 
   if (type === 'GENERATE') {
-    const { prompt, context, mode } = payload as { prompt: string; context: string; mode: AppMode };
+    const { prompt: rawPrompt, context: rawContext, mode } = payload as
+      { prompt: unknown; context: unknown; mode: AppMode };
+    // Defensive: never trust the caller for type or length.
+    const prompt = typeof rawPrompt === 'string' ? rawPrompt.slice(0, MAX_PROMPT_CHARS) : '';
+    const context = typeof rawContext === 'string' ? rawContext : '';
 
     // 1. RUN SAFETY SCANNER
     const { hasDistress, flags } = scanForDistress(prompt);

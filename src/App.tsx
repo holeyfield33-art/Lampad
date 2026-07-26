@@ -28,6 +28,17 @@ import {
 } from './lib/db';
 import { COUNTY_PASSAGES } from './data/passages';
 
+// Endpoint that queued SOS packets are forwarded to once connectivity returns.
+// Documented in .env.example as VITE_SOS_ENDPOINT; falls back to the hosted
+// backend so an unconfigured build keeps the previous behaviour.
+const SOS_ENDPOINT =
+  (import.meta.env.VITE_SOS_ENDPOINT || '').trim() ||
+  'https://lampad-backend.onrender.com/api/sos';
+
+// Upper bound on a single prompt. Without it a large paste locks the input for
+// minutes while the fallback engine streams one chunk per word.
+const MAX_PROMPT_CHARS = 2000;
+
 // ==========================================
 // PREACT FINE-GRAINED STATE SIGNALS
 // ==========================================
@@ -54,6 +65,7 @@ const dbChunksCount = signal<number>(0);
 const pendingSosRecords = signal<SOSRecord[]>([]);
 const isSyncingSOS = signal<boolean>(false);
 const showSyncSuccessToast = signal<boolean>(false);
+const showSyncFailureToast = signal<boolean>(false);
 const showCelebrateToast = signal<boolean>(false);
 
 // Chat history state
@@ -95,26 +107,34 @@ async function updateSOSState() {
 
 async function triggerAutomatedSync() {
   if (isSyncingSOS.value || !isOnline.value) return;
+  // Claim the lock before the first await: two concurrent callers (the online
+  // event and the isOnline effect) would otherwise both pass the guard and
+  // deliver every queued packet twice.
+  isSyncingSOS.value = true;
+
+  let delivered = 0;
+  let failed = 0;
 
   try {
     const db = await openDB();
     const unsynced = await getUnsyncedLogs(db);
 
     if (unsynced.length > 0) {
-      isSyncingSOS.value = true;
       console.log(`[Sync Engine] Found ${unsynced.length} unsynced emergency logs. Syncing...`);
 
       for (const log of unsynced) {
         try {
-          // Attempt post to Render backend SOS endpoint
-          const res = await fetch('https://lampad-backend.onrender.com/api/sos', {
+          // Attempt post to the configured SOS endpoint. The timeout keeps a
+          // hanging backend from stalling the whole queue indefinitely.
+          const res = await fetch(SOS_ENDPOINT, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               timestamp: log.timestamp,
               prompt: log.prompt,
               flags: log.flags
-            })
+            }),
+            signal: AbortSignal.timeout(15000)
           });
 
           if (res.ok) {
@@ -128,17 +148,30 @@ async function triggerAutomatedSync() {
               req.onsuccess = () => resolve();
               req.onerror = () => reject();
             });
+            delivered++;
           } else {
+            failed++;
             console.warn(`[Sync Engine] Backend returned ${res.status}; keeping log queued for retry.`);
           }
         } catch (postErr) {
+          failed++;
           console.warn('[Sync Engine] Backend unavailable, keeping offline logs armed:', postErr);
         }
       }
 
       await updateSOSState();
-      showSyncSuccessToast.value = true;
-      setTimeout(() => { showSyncSuccessToast.value = false; }, 4000);
+
+      // Only claim success for packets the backend actually accepted. Reporting
+      // "sync successful" after every attempt failed would tell someone in
+      // distress that help was notified when nothing left the device.
+      if (delivered > 0) {
+        showSyncSuccessToast.value = true;
+        setTimeout(() => { showSyncSuccessToast.value = false; }, 4000);
+      }
+      if (failed > 0) {
+        showSyncFailureToast.value = true;
+        setTimeout(() => { showSyncFailureToast.value = false; }, 6000);
+      }
     }
   } catch (err) {
     console.error('[Sync Engine] Sync failed:', err);
@@ -151,7 +184,9 @@ async function triggerAutomatedSync() {
 // CHAT GENERATION HANDLER
 // ==========================================
 async function handleSendMessage() {
-  const promptText = inputPrompt.value.trim();
+  // The input carries maxLength, but cap here too so a programmatic caller
+  // cannot hand the worker a prompt large enough to lock the UI for minutes.
+  const promptText = inputPrompt.value.trim().slice(0, MAX_PROMPT_CHARS);
   if (!promptText || isGenerating.value) return;
 
   const currentAppMode = currentMode.value;
@@ -299,19 +334,31 @@ export default function App() {
         pingTestPassed.value = latencies.inferenceLatency < 5.0 && latencies.retrievalLatency < 5.0;
 
         // 4. Initialize Local inference engine (Web-LLM)
-        await workerManager.initInferenceEngine((progressReport: any) => {
+        const engineInfo = await workerManager.initInferenceEngine((progressReport: any) => {
           modelProgress.value = progressReport.progress;
           modelProgressText.value = progressReport.text;
-          
+
           if (progressReport.progress >= 1.0) {
-            isModelLoaded.value = true;
             showCelebrateToast.value = true;
             setTimeout(() => { showCelebrateToast.value = false; }, 5000);
           }
         });
 
+        // The engine is ready once INIT_ENGINE resolves. On devices without
+        // WebGPU (or when the weight download fails) the worker resolves
+        // straight into keyword-fallback mode without ever reporting 100%, and
+        // keying the loader panel off progress alone left it on screen forever.
+        isModelLoaded.value = true;
+        if (engineInfo?.fallback) {
+          modelProgress.value = 1;
+          modelProgressText.value = 'WebGPU unavailable — keyword fallback engine active';
+        }
+
       } catch (err) {
         console.error('[Initialization Error] System boot failed:', err);
+        isModelLoaded.value = true;
+        isEmbeddingLoaded.value = true;
+        modelProgressText.value = 'Engine init failed — running in fallback mode';
       }
     };
 
@@ -580,7 +627,8 @@ export default function App() {
             </div>
 
             <p className="text-[11px] text-industrial-ink/75 leading-relaxed font-sans mb-3">
-              Secure native IndexedDB store tracks and logs critical distress incidents offline. Syncs with backend automatically when connection recovers.
+              Distress incidents are stored in this browser's IndexedDB while offline. When connectivity returns, each
+              pending record — including the prompt text that triggered it — is sent to the configured SOS endpoint.
             </p>
 
             {/* SOS List Container */}
@@ -683,7 +731,9 @@ export default function App() {
             <div className="flex-1 flex flex-col justify-between overflow-hidden p-3 md:p-6">
               
               {/* Chat Viewport (Plain industrial paper printout look) */}
-              <div className="flex-1 bg-industrial-paper border border-industrial-ink p-4 font-mono text-xs overflow-y-auto flex flex-col space-y-4">
+              {/* select-text: the shell sets select-none, but hotline numbers
+                  in the answers have to be selectable and copyable. */}
+              <div className="flex-1 bg-industrial-paper border border-industrial-ink p-4 font-mono text-xs overflow-y-auto flex flex-col space-y-4 select-text">
                 
                 {/* Initial Welcome Printout */}
                 <div className="flex gap-4 items-start border-b border-industrial-ink/10 pb-3">
@@ -777,6 +827,7 @@ export default function App() {
                   <input
                     type="text"
                     value={inputPrompt.value}
+                    maxLength={MAX_PROMPT_CHARS}
                     onInput={(e) => inputPrompt.value = (e.target as HTMLInputElement).value}
                     placeholder={
                       currentMode.value === 'INFO'
@@ -959,7 +1010,23 @@ export default function App() {
           <div className="space-y-1">
             <h4 className="text-xs font-bold uppercase tracking-wider font-mono">SOS Log Sync Successful</h4>
             <p className="text-[11px] text-industrial-ink/80 leading-normal font-sans font-medium">
-              Connection restabilized. Encrypted emergency incident logs synced securely to remote responders.
+              Connection restabilized. Queued incident logs were accepted by the configured SOS endpoint.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* 3. Sync failure notice — the queue is still armed, nothing was delivered */}
+      {showSyncFailureToast.value && (
+        <div id="sync-failure-toast" className="fixed bottom-28 right-6 bg-industrial-paper border-2 border-industrial-warning shadow-2xl p-4 flex items-start gap-3 max-w-sm z-50 text-industrial-ink">
+          <div className="bg-industrial-warning text-white p-2 border border-industrial-ink shrink-0">
+            <AlertTriangle className="w-5 h-5" />
+          </div>
+          <div className="space-y-1">
+            <h4 className="text-xs font-bold uppercase tracking-wider font-mono">SOS Sync Failed</h4>
+            <p className="text-[11px] text-industrial-ink/80 leading-normal font-sans font-medium">
+              The SOS endpoint could not be reached. Your incident logs are still stored on this device and remain
+              queued for retry — nobody has been notified yet.
             </p>
           </div>
         </div>
