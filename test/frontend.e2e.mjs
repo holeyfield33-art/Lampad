@@ -160,9 +160,20 @@ describe('frontend regressions', { skip: chromium ? false : 'playwright not inst
     }
   });
 
+  // No explicit version here: the app's own mount effect (updateSOSState in
+  // App.tsx) opens the DB at DB_VERSION within milliseconds of #app-root
+  // existing, so a hardcoded lower version here raced it and lost — the app's
+  // open won, and this helper's `indexedDB.open(name, 1)` then threw a
+  // VersionError that was silently swallowed into `resolve(false)`, seeding
+  // nothing and leaving every SOS-sync test to time out waiting for a toast
+  // that had nothing to report. Opening with no version argument attaches to
+  // whatever version already exists (or creates fresh at v1, handled by
+  // onupgradeneeded below, if this genuinely runs first) and never conflicts
+  // with the app either way. Failures now reject instead of resolving
+  // false/[] so a real regression fails fast instead of a 30s timeout.
   async function seedPendingSos(page, prompt) {
-    return page.evaluate(p => new Promise(res => {
-      const r = indexedDB.open('AtlasBridgeDB', 1);
+    const ok = await page.evaluate(p => new Promise((res, rej) => {
+      const r = indexedDB.open('AtlasBridgeDB');
       r.onupgradeneeded = e => {
         const db = e.target.result;
         if (!db.objectStoreNames.contains('pending_sos')) {
@@ -174,21 +185,22 @@ describe('frontend regressions', { skip: chromium ? false : 'playwright not inst
         const st = db.transaction('pending_sos', 'readwrite').objectStore('pending_sos');
         const add = st.add({ timestamp: new Date().toISOString(), prompt: p, flags: ['sos'], synced: false });
         add.onsuccess = () => res(true);
-        add.onerror = () => res(false);
+        add.onerror = () => rej(add.error);
       };
-      r.onerror = () => res(false);
+      r.onerror = () => rej(r.error);
     }), prompt);
+    assert.equal(ok, true, 'seedPendingSos: write did not succeed');
   }
 
   function readSos(page) {
-    return page.evaluate(() => new Promise(res => {
-      const r = indexedDB.open('AtlasBridgeDB', 1);
+    return page.evaluate(() => new Promise((res, rej) => {
+      const r = indexedDB.open('AtlasBridgeDB');
       r.onsuccess = e => {
         const g = e.target.result.transaction('pending_sos', 'readonly').objectStore('pending_sos').getAll();
         g.onsuccess = () => res(g.result);
-        g.onerror = () => res([]);
+        g.onerror = () => rej(g.error);
       };
-      r.onerror = () => res([]);
+      r.onerror = () => rej(r.error);
     }));
   }
 
