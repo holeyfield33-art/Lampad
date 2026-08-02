@@ -1,5 +1,75 @@
 # Pre-Launch Audit — Lampad AtlasBridge
 
+> **Status update — 2026-08-02 (18 days to the Aug 20 deadline).** Re-verified
+> this audit's baseline on the unchanged HEAD (`bcf076f`): `npm ci`, `npm run
+> lint`, `npm run build`, `npm test` (68/68) all still green, and every "Open
+> findings" row below is still present exactly as described — nothing has
+> drifted since this audit was written. Three things changed on top of it:
+> `package.json` renamed from `react-example` to `lampad-atlasbridge` (the P3
+> below is now resolved), the README config table gained the previously
+> undocumented `SOS_FORWARD_TIMEOUT_MS`, and `CODE_OF_CONDUCT.md`'s blank
+> enforcement-contact sentence was filled in. Two things are new since this
+> audit was written and are **not** yet reflected below: `npm audit` now runs
+> in this environment (see "Unverified" — it was non-functional on 07-26) and
+> reports 9 vulnerabilities, 1 critical; and 3 of 5 `test:e2e` SOS-sync tests
+> timed out in this session's sandbox while the other 2 passed.
+>
+> **Round 2, same day.** The 3 e2e timeouts were not a sandbox artifact — root
+> caused to a genuine race in the test harness (not the app): `App.tsx`'s mount
+> effect opens `AtlasBridgeDB` at `DB_VERSION` (2) within milliseconds of
+> `#app-root` existing, but `seedPendingSos`/`readSos` in
+> `test/frontend.e2e.mjs` hardcoded a v1 open. When the app's open won that
+> race, the test's lower-version open threw a `VersionError` that was silently
+> swallowed into `resolve(false)`, so the seed wrote nothing and every
+> SOS-sync assertion timed out waiting for a toast with nothing to report.
+> Fixed by opening with no explicit version (attaches to whatever exists) and
+> rejecting instead of swallowing errors. All 5 `test:e2e` cases now pass in
+> under 1s each instead of 3 timing out at 30s.
+>
+> `npm audit`: fixed `body-parser` (production-facing, in `server.js`) and
+> `postcss` via `package.json` `overrides` — safe patch bumps, 9 → 5
+> vulnerabilities, all tests still green. The remaining 5 (`protobufjs`,
+> `sharp`, `onnxruntime-web`, all transitively pulled in by
+> `@xenova/transformers`) were confirmed unreachable: zero `protobuf` strings
+> in the built browser worker bundles (the WASM backend doesn't need the JS
+> parser), and `sharp` is a native Node addon that cannot run in a browser and
+> is not touched by any script in this repo. Fixing them needs
+> `@xenova/transformers@1.4.2`, a 2-major-version downgrade of the retrieval
+> engine — not attempted; too high-risk this close to the deadline for a
+> vulnerability with no real reach into this app.
+>
+> Also closed, all code-only (no product/human judgement required), each with
+> a regression test that fails before the fix and passes after (added to
+> `test/frontend.e2e.mjs`, run via `npm run test:e2e`):
+> - **Markdown bold never rendered** (P3 below) — added `renderInlineMarkdown`
+>   in `App.tsx`; verified against `renderLesson`'s heavily-bold English Tutor
+>   output, which is reachable in the keyword-fallback path exercised here.
+> - **Fake footer telemetry** (P3 below) — `UUID_SESSION` is now
+>   `crypto.randomUUID()` per load, `ESM_WORKER_POOL` reflects real worker
+>   readiness, `BUILD_DATE` is injected at build time via a Vite `define`
+>   (`vite.config.ts`) instead of a stale literal.
+> - **Dead code** (P3 below) — `markLogAsSynced` (unused) deleted from
+>   `src/lib/db.ts`; `pingTestPassed` (computed, never displayed) is now shown
+>   as a Latency Check indicator in the sidebar.
+> - **No retry after a failed model download** (P2 below) — added a "Retry
+>   loading full model" button, shown only when the worker reports
+>   `gpuSupported: true` (WebGPU present but the fetch failed) as opposed to no
+>   WebGPU at all. Implementing it surfaced a real latent bug: the worker's
+>   `useFallback` flag was set `true` on a failed `INIT_ENGINE` and never reset
+>   on a later successful one, so a successful retry would have silently kept
+>   answering from the fallback engine while reporting success — fixed in
+>   `inference.worker.ts`. The full retry-succeeds path still needs a real
+>   WebGPU device to verify end-to-end (same constraint as the rest of the
+>   WebGPU path — see Unverified); what's tested here is that the button
+>   correctly stays hidden on an ordinary no-WebGPU device.
+>
+> Not touched — still need a human call, see the chat summary for the full
+> list: the distress-scanner term list, `/api/sos` authentication, and
+> `CORS_ORIGIN` (all P2, architecture/product decisions), plus everything
+> under "Unverified" below (WebGPU on real hardware, offline/airplane mode,
+> the ~400MB figure, the Render deploy, real-device PWA install) and the 10
+> `needs-review` knowledge passages in `docs/DATA_REVIEW.md`.
+
 **Date:** 2026-07-26
 **Commit audited:** `4c51916` (branch `claude/pre-launch-audit-hardening-6d8jjz`)
 **Classification:** Web app with a backend — static Vite/Preact PWA (all inference
@@ -68,12 +138,12 @@ Also fixed as trivial, zero-risk changes alongside the above:
 | P2 | **The distress scanner fires on ordinary questions.** `DISTRESS_REGEX` includes `emergency`, `police`, `dangerous`, `escape` and `unpaid` — words the app's own placeholder text invites ("Ask about local transit, BART, shelter clinics, legal, or SOS alerts"). Asking *"Where can I find emergency shelter in Milpitas?"* silently writes an SOS record and later transmits that prompt off-device. | In the running app, ask *"Where can I find emergency shelter in Milpitas?"* — the SOS panel gains a PENDING record. Measured in the browser: one ordinary question plus one genuine distress message left **2** rows in `pending_sos`. `grep -n "DISTRESS_REGEX =" src/workers/inference.worker.ts` shows the term list. | Narrowing the term list is a safety/product judgement (false negatives are worse than false positives here) and changes what gets escalated. Owner's call. |
 | P2 | **`/api/sos` has no authentication.** Anyone can POST a packet. Now rate-limited and validated, but an attacker can still inject plausible SOS packets into a responder webhook. | `curl -X POST …/api/sos -d '{"timestamp":"t","prompt":"help"}'` → `HTTP 201`, no credentials | A browser client cannot hold a secret, so this needs a gateway, a signed client, or a human triage step — an architecture decision, not a patch. Documented in the README. |
 | P2 | **`CORS_ORIGIN` defaults to `*` and `render.yaml` does not set it.** | `curl -i …/health` → `Access-Control-Allow-Origin: *` | The API is credential-less so `*` is not itself an escalation; setting it is a deploy-time decision (the frontend's production origin isn't fixed in-repo). |
-| P2 | **The 400 MB model download has no progress recovery.** If `CreateMLCEngine` fails mid-download the app silently drops to keyword fallback; the user is told "keyword fallback engine active" but is never offered a retry. | Observed in every browser run: `Web-LLM loading failed, falling back to client-side compiler engine: TypeError: Failed to fetch` | Adding a retry affordance is feature work. |
-| P3 | **Markdown bold is never rendered.** The message renderer handles `### `, `- `, and `*   ` prefixes but not inline `**`, so every answer shows literal asterisks. | Observed in the browser: the rendered text node reads `**Milpitas Police Department:** Non-emergency dispatch can be reached at **(408) 586-2400**`. `grep -n "startsWith" src/App.tsx` shows the renderer handles only line prefixes. | Needs a real inline-markdown renderer; visible in every response but cosmetic. |
-| P3 | **Hardcoded fake telemetry in the UI.** Footer shows `UUID_SESSION: 4f9d-128a-88bc-atlas`, `ESM_WORKER_POOL: 2/2 ACTIVE`, and `BUILD_DATE: 2026-06-27` — all static literals, and the build date is already stale. The sidebar's "100 % SECURE_ON_DEVICE" bar and "Thread correlation mapping" blocks are decorative. | `grep -n "UUID_SESSION\|BUILD_DATE\|ESM_WORKER_POOL" src/App.tsx` | Cosmetic, but worth a pass before demoing to judges — fake instrumentation reads badly next to real instrumentation. |
-| P3 | **`markLogAsSynced` in `src/lib/db.ts` is dead code.** `App.tsx` writes the record inline instead, so the exported helper is never called. | `grep -rn "markLogAsSynced" src/` → definition only | Harmless; removing it is churn. |
-| P3 | **`pingTestPassed` is computed and never used.** The <5 ms ping assertion is evaluated on boot and the result is discarded. | `grep -rn "pingTestPassed" src/` → set once, read nowhere | Harmless. |
-| P3 | **`package.json` is still named `react-example` v0.0.0** on a project that ships as Lampad AtlasBridge and uses Preact. | `grep '"name"' package.json` | Cosmetic; renaming touches nothing functional but is the owner's branding call. |
+| P2 | **The 400 MB model download has no progress recovery.** If `CreateMLCEngine` fails mid-download the app silently drops to keyword fallback; the user is told "keyword fallback engine active" but is never offered a retry. | Observed in every browser run: `Web-LLM loading failed, falling back to client-side compiler engine: TypeError: Failed to fetch` | **RESOLVED 2026-08-02.** "Retry loading full model" button added, gated on `gpuSupported: true`. See Round 2 note above — also fixed a latent `useFallback` bug this surfaced. |
+| P3 | **Markdown bold is never rendered.** The message renderer handles `### `, `- `, and `*   ` prefixes but not inline `**`, so every answer shows literal asterisks. | Observed in the browser: the rendered text node reads `**Milpitas Police Department:** Non-emergency dispatch can be reached at **(408) 586-2400**`. `grep -n "startsWith" src/App.tsx` shows the renderer handles only line prefixes. | **RESOLVED 2026-08-02.** `renderInlineMarkdown` added; regression test in `test/frontend.e2e.mjs`. |
+| P3 | **Hardcoded fake telemetry in the UI.** Footer shows `UUID_SESSION: 4f9d-128a-88bc-atlas`, `ESM_WORKER_POOL: 2/2 ACTIVE`, and `BUILD_DATE: 2026-06-27` — all static literals, and the build date is already stale. The sidebar's "100 % SECURE_ON_DEVICE" bar and "Thread correlation mapping" blocks are decorative. | `grep -n "UUID_SESSION\|BUILD_DATE\|ESM_WORKER_POOL" src/App.tsx` | **RESOLVED 2026-08-02** for the three literals — now real (see Round 2 note above). The "100% SECURE_ON_DEVICE" bar and "Thread correlation mapping" blocks are still decorative; left as-is, lower stakes than instrumentation claiming a specific fake value. |
+| P3 | **`markLogAsSynced` in `src/lib/db.ts` is dead code.** `App.tsx` writes the record inline instead, so the exported helper is never called. | `grep -rn "markLogAsSynced" src/` → definition only | **RESOLVED 2026-08-02.** Deleted. |
+| P3 | **`pingTestPassed` is computed and never used.** The <5 ms ping assertion is evaluated on boot and the result is discarded. | `grep -rn "pingTestPassed" src/` → set once, read nowhere | **RESOLVED 2026-08-02.** Now displayed as a Latency Check indicator in the sidebar. |
+| P3 | **`package.json` is still named `react-example` v0.0.0** on a project that ships as Lampad AtlasBridge and uses Preact. | `grep '"name"' package.json` | **RESOLVED 2026-08-02.** Renamed to `lampad-atlasbridge`. |
 
 ---
 

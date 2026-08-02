@@ -122,7 +122,11 @@ Settlement + People's Choice.
 
 ## Honest gaps a judge could find
 
-Ranked by how likely they are to be noticed.
+Ranked by how likely they are to be noticed. **Updated 2026-08-02** — markdown
+rendering, fake telemetry, dead code, and a missing model-download retry
+(formerly gaps 6 and 8, plus two P3s not listed here) are fixed; see
+`AUDIT.md`'s "Round 2" note. What's left all needs a human — none of it is
+something an agent working from this repo alone can close.
 
 1. **No demo video.** Hard requirement. Nothing else matters if this is missing.
 2. **The WebGPU path has never been verified end-to-end.** No GPU and no model
@@ -130,33 +134,35 @@ Ranked by how likely they are to be noticed.
    untested. **Test this on real hardware before the demo** — it is the headline
    claim. If it does not work on your demo machine, you will be demoing the
    fallback, which is now good but is not the same story.
-3. **Offline mode has never been verified.** The service worker precaches the
-   shell (11 entries); model weights are cached at runtime by web-llm, which was
-   unreachable here. Load the app, let both models download, then airplane-mode
-   it. If you plan to demo this on stage, rehearse it.
+3. **Offline mode needs re-verification.** You confirmed this worked before the
+   pre-launch-audit fixes landed (2026-07-26) and again since; nothing in this
+   round of changes touched the service worker or model caching, but re-check
+   after this round too since a few workers/App.tsx edits landed (inline
+   markdown rendering, the retry button, a `useFallback` fix). Load the app,
+   let both models download, then airplane-mode it.
 4. **10 of 18 passages are `needs-review`** — see `docs/DATA_REVIEW.md`. The
    local phone numbers were never independently confirmed. An immigration
    attorney judge who calls one number on stage and gets a disconnected line
    erases the credibility the CFR citations bought you. Highest-value hour of
    work available.
-5. **`npm audit` has never run** — the registry endpoint fails through this
-   environment's proxy. Unknown dependency vulnerability posture.
-6. **Markdown bold is not rendered.** Every answer displays literal `**asterisks**`.
-   Cosmetic, visible in every screenshot and every second of the video.
-7. **The distress scanner false-positives on "emergency" and "police"** — words
+5. **The distress scanner false-positives on "emergency" and "police"** — words
    the app's own placeholder invites — silently creating SOS records and
    transmitting the prompt off-device. A judge typing "where is the emergency
-   room" triggers it.
-8. **Fake telemetry in the footer.** `UUID_SESSION: 4f9d-128a-88bc-atlas`,
-   `ESM_WORKER_POOL: 2/2 ACTIVE`, `BUILD_DATE: 2026-06-27` are hardcoded
-   literals sitting next to real instrumentation. Cheap to fix, bad to be asked
-   about.
+   room" triggers it. Narrowing the term list is a safety/product judgement
+   (false negatives are worse than false positives here) — your call, not one
+   to automate.
+6. **`npm audit`: 5 vulnerabilities remain**, down from 9 — `body-parser` and
+   `postcss` were patched (safe, no breaking changes). The rest (`protobufjs`,
+   `sharp`, `onnxruntime-web`) are all transitively pulled in by
+   `@xenova/transformers` and confirmed unreachable in this app (not in the
+   shipped browser bundle; `sharp` is a native Node addon nothing here calls).
+   Fixing them needs a 2-major-version downgrade of the retrieval engine — not
+   worth the risk this close to the deadline unless you want to revisit it.
 
 ## Suggested order of work
 
 1. Verify the WebGPU + offline path on the demo machine (gaps 2, 3).
 2. Confirm the 8 local phone numbers and addresses (gap 4).
 3. Record the demo video (gap 1).
-4. Fix markdown rendering and delete the fake telemetry (gaps 6, 8).
-5. Write the Devpost long-form description.
-6. Decide on the distress-scanner term list (gap 7).
+4. Write the Devpost long-form description.
+5. Decide on the distress-scanner term list (gap 5).

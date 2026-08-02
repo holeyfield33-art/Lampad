@@ -125,6 +125,11 @@ describe('frontend regressions', { skip: chromium ? false : 'playwright not inst
         null,
         { timeout: 30000 }
       );
+
+      // The retry button is only for "WebGPU present but the fetch failed" —
+      // a device with no WebGPU at all (this test) has nothing to retry, so
+      // it must not appear and dangle a false promise of a different outcome.
+      assert.equal(await page.locator('#retry-model-load').count(), 0);
     } finally {
       await ctx.close();
     }
@@ -160,9 +165,20 @@ describe('frontend regressions', { skip: chromium ? false : 'playwright not inst
     }
   });
 
+  // No explicit version here: the app's own mount effect (updateSOSState in
+  // App.tsx) opens the DB at DB_VERSION within milliseconds of #app-root
+  // existing, so a hardcoded lower version here raced it and lost — the app's
+  // open won, and this helper's `indexedDB.open(name, 1)` then threw a
+  // VersionError that was silently swallowed into `resolve(false)`, seeding
+  // nothing and leaving every SOS-sync test to time out waiting for a toast
+  // that had nothing to report. Opening with no version argument attaches to
+  // whatever version already exists (or creates fresh at v1, handled by
+  // onupgradeneeded below, if this genuinely runs first) and never conflicts
+  // with the app either way. Failures now reject instead of resolving
+  // false/[] so a real regression fails fast instead of a 30s timeout.
   async function seedPendingSos(page, prompt) {
-    return page.evaluate(p => new Promise(res => {
-      const r = indexedDB.open('AtlasBridgeDB', 1);
+    const ok = await page.evaluate(p => new Promise((res, rej) => {
+      const r = indexedDB.open('AtlasBridgeDB');
       r.onupgradeneeded = e => {
         const db = e.target.result;
         if (!db.objectStoreNames.contains('pending_sos')) {
@@ -174,21 +190,22 @@ describe('frontend regressions', { skip: chromium ? false : 'playwright not inst
         const st = db.transaction('pending_sos', 'readwrite').objectStore('pending_sos');
         const add = st.add({ timestamp: new Date().toISOString(), prompt: p, flags: ['sos'], synced: false });
         add.onsuccess = () => res(true);
-        add.onerror = () => res(false);
+        add.onerror = () => rej(add.error);
       };
-      r.onerror = () => res(false);
+      r.onerror = () => rej(r.error);
     }), prompt);
+    assert.equal(ok, true, 'seedPendingSos: write did not succeed');
   }
 
   function readSos(page) {
-    return page.evaluate(() => new Promise(res => {
-      const r = indexedDB.open('AtlasBridgeDB', 1);
+    return page.evaluate(() => new Promise((res, rej) => {
+      const r = indexedDB.open('AtlasBridgeDB');
       r.onsuccess = e => {
         const g = e.target.result.transaction('pending_sos', 'readonly').objectStore('pending_sos').getAll();
         g.onsuccess = () => res(g.result);
-        g.onerror = () => res([]);
+        g.onerror = () => rej(g.error);
       };
-      r.onerror = () => res([]);
+      r.onerror = () => rej(r.error);
     }));
   }
 
@@ -270,6 +287,62 @@ describe('frontend regressions', { skip: chromium ? false : 'playwright not inst
         false,
         'still posting to the hardcoded production host'
       );
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  // Regression: the message renderer handled line prefixes (###, -, *   ) but
+  // not inline **bold**, so every English Tutor lesson (which is built with
+  // heavy **bold** markup in src/workers/fallback.ts renderLesson) showed
+  // literal asterisks instead of bold text.
+  test('English Tutor markdown bold renders as <strong>, not literal asterisks', async () => {
+    const { ctx, page } = await openApp();
+    try {
+      await page.goto(BASE, { waitUntil: 'load' });
+      await page.waitForSelector('#app-root');
+      await page.waitForSelector('#model-loader-panel', { state: 'detached', timeout: 60000 });
+      await page.locator('button:has-text("English Tutor")').click();
+
+      await page.locator('form input[type=text]').first().fill('How do I talk to a landlord?');
+      await page.locator('button[type=submit]').click();
+      await page.waitForFunction(
+        () => document.querySelector('#main-workbench')?.textContent?.includes('Vocabulary & Translation'),
+        null,
+        { timeout: 30000 }
+      );
+
+      const text = await page.locator('#main-workbench').innerText();
+      assert.equal(
+        text.includes('**'),
+        false,
+        `literal markdown asterisks leaked into rendered text: ${text.slice(0, 400)}`
+      );
+      const strongCount = await page.locator('#main-workbench strong').count();
+      assert.ok(strongCount > 0, 'expected at least one <strong> element from rendered **bold** markdown');
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  // Regression: the footer showed hardcoded literals (UUID_SESSION,
+  // ESM_WORKER_POOL, a stale BUILD_DATE) next to real instrumentation.
+  test('footer diagnostics reflect real state, not hardcoded literals', async () => {
+    const { ctx, page } = await openApp({ killGpu: true });
+    try {
+      await page.goto(BASE, { waitUntil: 'load' });
+      await page.waitForSelector('#app-root');
+      await page.waitForSelector('#model-loader-panel', { state: 'detached', timeout: 60000 });
+
+      const footerText = await page.locator('#system-footer').innerText();
+      assert.doesNotMatch(footerText, /4f9d-128a-88bc-atlas/, 'UUID_SESSION is still the hardcoded literal');
+      assert.match(
+        footerText,
+        /UUID_SESSION: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i,
+        'expected a real UUID in UUID_SESSION'
+      );
+      assert.doesNotMatch(footerText, /BUILD_DATE: 2026-06-27/, 'BUILD_DATE is still the stale hardcoded literal');
+      assert.match(footerText, /BUILD_DATE: \d{4}-\d{2}-\d{2}/, 'expected an actual build date');
     } finally {
       await ctx.close();
     }

@@ -1,5 +1,5 @@
 {
-  "name": "react-example",
+  "name": "lampad-atlasbridge",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -36,5 +36,9 @@
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",
     "@types/express": "^4.17.21"
+  },
+  "overrides": {
+    "body-parser": "1.20.6",
+    "postcss": "8.5.25"
   }
 }

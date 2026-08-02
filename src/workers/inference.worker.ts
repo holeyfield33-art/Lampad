@@ -139,6 +139,11 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
         }
       });
 
+      // A retry after an earlier failed attempt must actually switch
+      // GENERATE back to the real engine; without this, useFallback stays
+      // true forever once set once, and a successful retry would silently
+      // keep answering from the fallback engine while reporting success.
+      useFallback = false;
       self.postMessage({ id, type, status: 'SUCCESS', payload: { fallback: false, gpuSupported: true } });
     } catch (err: any) {
       console.error('Web-LLM loading failed, falling back to client-side compiler engine:', err);
