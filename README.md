@@ -125,6 +125,7 @@ features need no configuration at all.
 | `BUNDLE_DIR` | `server.js` | Directory the hub serves packs from. Defaults to `public/bundles`. |
 | `PORT` | `server.js` | Port the SOS backend listens on. |
 | `SOS_FORWARD_URL` | `server.js` | Optional upstream webhook that received packets are forwarded to. |
+| `SOS_FORWARD_TIMEOUT_MS` | `server.js` | How long to wait on that upstream before giving up. Defaults to 10000. |
 | `CORS_ORIGIN` | `server.js` | Allowed origin for the SOS API. Defaults to `*`. |
 | `SOS_RATE_MAX` / `SOS_RATE_WINDOW_MS` | `server.js` | Per-IP rate limit on `/api/sos` (default 30 requests per minute). |
 

@@ -1,5 +1,23 @@
 # Pre-Launch Audit — Lampad AtlasBridge
 
+> **Status update — 2026-08-02 (18 days to the Aug 20 deadline).** Re-verified
+> this audit's baseline on the unchanged HEAD (`bcf076f`): `npm ci`, `npm run
+> lint`, `npm run build`, `npm test` (68/68) all still green, and every "Open
+> findings" row below is still present exactly as described — nothing has
+> drifted since this audit was written. Three things changed on top of it:
+> `package.json` renamed from `react-example` to `lampad-atlasbridge` (the P3
+> below is now resolved), the README config table gained the previously
+> undocumented `SOS_FORWARD_TIMEOUT_MS`, and `CODE_OF_CONDUCT.md`'s blank
+> enforcement-contact sentence was filled in. Two things are new since this
+> audit was written and are **not** yet reflected below: `npm audit` now runs
+> in this environment (see "Unverified" — it was non-functional on 07-26) and
+> reports 9 vulnerabilities, 1 critical; and 3 of 5 `test:e2e` SOS-sync tests
+> timed out in this session's sandbox while the other 2 passed — likely a
+> sandbox networking artifact rather than a regression (code is byte-identical
+> to the 07-26 run where all 5 passed), but re-run `npm run test:e2e` on your
+> own machine before trusting it. Neither is fixed here — see the chat summary
+> for details and next steps.
+
 **Date:** 2026-07-26
 **Commit audited:** `4c51916` (branch `claude/pre-launch-audit-hardening-6d8jjz`)
 **Classification:** Web app with a backend — static Vite/Preact PWA (all inference
