@@ -88,30 +88,6 @@ export function getAllLogs(db: IDBDatabase): Promise<SOSRecord[]> {
   });
 }
 
-export function markLogAsSynced(db: IDBDatabase, id: number | undefined): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (id === undefined) return resolve();
-
-    const tx = db.transaction(SOS_STORE, 'readwrite');
-    const store = tx.objectStore(SOS_STORE);
-    
-    // Get record first
-    const getReq = store.get(id);
-    getReq.onsuccess = () => {
-      const record = getReq.result;
-      if (record) {
-        record.synced = true;
-        const putReq = store.put(record);
-        putReq.onsuccess = () => resolve();
-        putReq.onerror = () => reject(new Error('Failed to update record'));
-      } else {
-        resolve();
-      }
-    };
-    getReq.onerror = () => reject(new Error('Failed to fetch record to sync'));
-  });
-}
-
 export function clearSyncedLogs(db: IDBDatabase): Promise<void> {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(SOS_STORE, 'readwrite');

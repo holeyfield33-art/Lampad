@@ -125,6 +125,11 @@ describe('frontend regressions', { skip: chromium ? false : 'playwright not inst
         null,
         { timeout: 30000 }
       );
+
+      // The retry button is only for "WebGPU present but the fetch failed" —
+      // a device with no WebGPU at all (this test) has nothing to retry, so
+      // it must not appear and dangle a false promise of a different outcome.
+      assert.equal(await page.locator('#retry-model-load').count(), 0);
     } finally {
       await ctx.close();
     }
@@ -282,6 +287,62 @@ describe('frontend regressions', { skip: chromium ? false : 'playwright not inst
         false,
         'still posting to the hardcoded production host'
       );
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  // Regression: the message renderer handled line prefixes (###, -, *   ) but
+  // not inline **bold**, so every English Tutor lesson (which is built with
+  // heavy **bold** markup in src/workers/fallback.ts renderLesson) showed
+  // literal asterisks instead of bold text.
+  test('English Tutor markdown bold renders as <strong>, not literal asterisks', async () => {
+    const { ctx, page } = await openApp();
+    try {
+      await page.goto(BASE, { waitUntil: 'load' });
+      await page.waitForSelector('#app-root');
+      await page.waitForSelector('#model-loader-panel', { state: 'detached', timeout: 60000 });
+      await page.locator('button:has-text("English Tutor")').click();
+
+      await page.locator('form input[type=text]').first().fill('How do I talk to a landlord?');
+      await page.locator('button[type=submit]').click();
+      await page.waitForFunction(
+        () => document.querySelector('#main-workbench')?.textContent?.includes('Vocabulary & Translation'),
+        null,
+        { timeout: 30000 }
+      );
+
+      const text = await page.locator('#main-workbench').innerText();
+      assert.equal(
+        text.includes('**'),
+        false,
+        `literal markdown asterisks leaked into rendered text: ${text.slice(0, 400)}`
+      );
+      const strongCount = await page.locator('#main-workbench strong').count();
+      assert.ok(strongCount > 0, 'expected at least one <strong> element from rendered **bold** markdown');
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  // Regression: the footer showed hardcoded literals (UUID_SESSION,
+  // ESM_WORKER_POOL, a stale BUILD_DATE) next to real instrumentation.
+  test('footer diagnostics reflect real state, not hardcoded literals', async () => {
+    const { ctx, page } = await openApp({ killGpu: true });
+    try {
+      await page.goto(BASE, { waitUntil: 'load' });
+      await page.waitForSelector('#app-root');
+      await page.waitForSelector('#model-loader-panel', { state: 'detached', timeout: 60000 });
+
+      const footerText = await page.locator('#system-footer').innerText();
+      assert.doesNotMatch(footerText, /4f9d-128a-88bc-atlas/, 'UUID_SESSION is still the hardcoded literal');
+      assert.match(
+        footerText,
+        /UUID_SESSION: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i,
+        'expected a real UUID in UUID_SESSION'
+      );
+      assert.doesNotMatch(footerText, /BUILD_DATE: 2026-06-27/, 'BUILD_DATE is still the stale hardcoded literal');
+      assert.match(footerText, /BUILD_DATE: \d{4}-\d{2}-\d{2}/, 'expected an actual build date');
     } finally {
       await ctx.close();
     }

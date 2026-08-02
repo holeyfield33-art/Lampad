@@ -41,6 +41,26 @@ const SOS_ENDPOINT =
 // minutes while the fallback engine streams one chunk per word.
 const MAX_PROMPT_CHARS = 2000;
 
+// Real per-load session id for the footer diagnostics strip (was a hardcoded
+// literal shared by every user).
+const SESSION_ID = crypto.randomUUID();
+
+// The line-prefix renderer below (###, -, *   ) never handled inline **bold**,
+// so every answer showed literal asterisks. Splits on **...** pairs and wraps
+// the matched text in <strong>; everything else passes through unchanged.
+function renderInlineMarkdown(text: string, keyPrefix: string) {
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  return parts.map((part, i) =>
+    part.startsWith('**') && part.endsWith('**') && part.length > 4 ? (
+      <strong key={`${keyPrefix}-${i}`} className="font-bold">
+        {part.slice(2, -2)}
+      </strong>
+    ) : (
+      <span key={`${keyPrefix}-${i}`}>{part}</span>
+    )
+  );
+}
+
 // ==========================================
 // PREACT FINE-GRAINED STATE SIGNALS
 // ==========================================
@@ -56,6 +76,11 @@ const modelProgressText = signal<string>('Not initialized');
 const isEmbeddingLoaded = signal<boolean>(false);
 const embeddingProgress = signal<number>(0);
 const embeddingProgressText = signal<string>('Ready');
+// True only when the device has WebGPU but the weight download itself
+// failed (e.g. a dropped connection mid-fetch) — the one case where trying
+// again might actually succeed, as opposed to no WebGPU at all.
+const modelLoadRetryable = signal<boolean>(false);
+const isRetryingModel = signal<boolean>(false);
 
 // Hardware & Ping diagnostics
 const webGpuSupported = signal<boolean>(false);
@@ -187,6 +212,52 @@ async function triggerAutomatedSync() {
     console.error('[Sync Engine] Sync failed:', err);
   } finally {
     isSyncingSOS.value = false;
+  }
+}
+
+// ==========================================
+// INFERENCE ENGINE LOADING (initial + retry)
+// ==========================================
+// Shared by the boot sequence and the manual retry button: a WebGPU device
+// whose weight download failed silently dropped to keyword fallback with no
+// way back. gpuSupported distinguishes "no WebGPU at all" (nothing to
+// retry) from "WebGPU present but the fetch failed" (retryable).
+async function loadInferenceEngine() {
+  const engineInfo = await workerManager.initInferenceEngine((progressReport: any) => {
+    modelProgress.value = progressReport.progress;
+    modelProgressText.value = progressReport.text;
+
+    if (progressReport.progress >= 1.0) {
+      showCelebrateToast.value = true;
+      setTimeout(() => { showCelebrateToast.value = false; }, 5000);
+    }
+  });
+
+  isModelLoaded.value = true;
+  if (engineInfo?.fallback) {
+    modelProgress.value = 1;
+    modelProgressText.value = engineInfo.gpuSupported
+      ? 'Model download failed — keyword fallback engine active'
+      : 'WebGPU unavailable — keyword fallback engine active';
+    modelLoadRetryable.value = !!engineInfo.gpuSupported;
+  } else {
+    modelLoadRetryable.value = false;
+  }
+}
+
+async function retryModelLoad() {
+  if (isRetryingModel.value) return;
+  isRetryingModel.value = true;
+  modelProgress.value = 0;
+  modelProgressText.value = 'Retrying model download...';
+  try {
+    await loadInferenceEngine();
+  } catch (err) {
+    console.error('[Retry] Model reload failed:', err);
+    modelProgressText.value = 'Retry failed — still running in fallback mode';
+    modelLoadRetryable.value = true;
+  } finally {
+    isRetryingModel.value = false;
   }
 }
 
@@ -372,26 +443,12 @@ export default function App() {
         retrievalPingMs.value = latencies.retrievalLatency;
         pingTestPassed.value = latencies.inferenceLatency < 5.0 && latencies.retrievalLatency < 5.0;
 
-        // 4. Initialize Local inference engine (Web-LLM)
-        const engineInfo = await workerManager.initInferenceEngine((progressReport: any) => {
-          modelProgress.value = progressReport.progress;
-          modelProgressText.value = progressReport.text;
-
-          if (progressReport.progress >= 1.0) {
-            showCelebrateToast.value = true;
-            setTimeout(() => { showCelebrateToast.value = false; }, 5000);
-          }
-        });
-
-        // The engine is ready once INIT_ENGINE resolves. On devices without
-        // WebGPU (or when the weight download fails) the worker resolves
-        // straight into keyword-fallback mode without ever reporting 100%, and
-        // keying the loader panel off progress alone left it on screen forever.
-        isModelLoaded.value = true;
-        if (engineInfo?.fallback) {
-          modelProgress.value = 1;
-          modelProgressText.value = 'WebGPU unavailable — keyword fallback engine active';
-        }
+        // 4. Initialize Local inference engine (Web-LLM). The engine is ready
+        // once INIT_ENGINE resolves either way: on devices without WebGPU (or
+        // when the weight download fails) the worker resolves straight into
+        // keyword-fallback mode without ever reporting 100%, and keying the
+        // loader panel off progress alone left it on screen forever.
+        await loadInferenceEngine();
 
       } catch (err) {
         console.error('[Initialization Error] System boot failed:', err);
@@ -576,6 +633,23 @@ export default function App() {
                     {retrievalPingMs.value.toFixed(2)}ms
                   </span>
                 </div>
+                <div className="flex justify-between items-center text-[11px] font-mono">
+                  <span className="opacity-75">Latency Check</span>
+                  <span className={`px-1.5 py-0.5 font-bold text-white ${pingTestPassed.value ? 'bg-industrial-accent' : 'bg-industrial-warning'}`}>
+                    {pingTestPassed.value ? 'PASS <5MS' : 'DEGRADED'}
+                  </span>
+                </div>
+                {modelLoadRetryable.value && (
+                  <button
+                    id="retry-model-load"
+                    onClick={retryModelLoad}
+                    disabled={isRetryingModel.value}
+                    className="w-full mt-1 flex items-center justify-center gap-1.5 border border-industrial-warning text-industrial-warning font-mono text-[10px] font-bold py-1.5 uppercase tracking-wider hover:bg-industrial-warning hover:text-white transition-colors disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-3 h-3 ${isRetryingModel.value ? 'animate-spin' : ''}`} />
+                    {isRetryingModel.value ? 'Retrying…' : 'Retry loading full model'}
+                  </button>
+                )}
               </div>
             </div>
           </div>
@@ -826,25 +900,25 @@ export default function App() {
                           if (line.startsWith('*   ')) {
                             return (
                               <li key={idx} className="list-disc ml-6 pl-1 text-industrial-ink/90 my-1 font-sans">
-                                {line.replace('*   ', '')}
+                                {renderInlineMarkdown(line.replace('*   ', ''), `${idx}`)}
                               </li>
                             );
                           }
                           if (line.startsWith('### ')) {
                             return (
                               <h4 key={idx} className="text-industrial-accent font-bold font-serif italic text-sm mt-3 mb-1.5">
-                                {line.replace('### ', '')}
+                                {renderInlineMarkdown(line.replace('### ', ''), `${idx}`)}
                               </h4>
                             );
                           }
                           if (line.startsWith('- ')) {
                             return (
                               <li key={idx} className="list-disc ml-6 text-industrial-ink/90 font-sans">
-                                {line.replace('- ', '')}
+                                {renderInlineMarkdown(line.replace('- ', ''), `${idx}`)}
                               </li>
                             );
                           }
-                          return <div key={idx} className="mb-1 font-sans">{line}</div>;
+                          return <div key={idx} className="mb-1 font-sans">{renderInlineMarkdown(line, `${idx}`)}</div>;
                         })
                       ) : (
                         <span className="inline-flex gap-2 items-center font-mono text-industrial-gray text-xs">
@@ -1214,14 +1288,16 @@ export default function App() {
           ========================================== */}
       <footer id="system-footer" className="h-8 border-t border-industrial-ink bg-industrial-ink text-white flex items-center px-4 justify-between font-mono text-[9px] shrink-0 select-none">
         <div className="flex gap-4">
-          <span>UUID_SESSION: 4f9d-128a-88bc-atlas</span>
-          <span className="hidden sm:inline">ESM_WORKER_POOL: 2/2 ACTIVE</span>
+          <span>UUID_SESSION: {SESSION_ID}</span>
+          <span className="hidden sm:inline">
+            ESM_WORKER_POOL: {(isModelLoaded.value ? 1 : 0) + (isEmbeddingLoaded.value ? 1 : 0)}/2 ACTIVE
+          </span>
         </div>
         <div className="flex gap-4">
           <span className={pendingSosRecords.value.some(r => !r.synced) ? "text-industrial-warning animate-pulse font-bold" : "text-industrial-accent font-bold"}>
             DB_SYNC_ARMED: {pendingSosRecords.value.some(r => !r.synced) ? 'TRUE' : 'FALSE'}
           </span>
-          <span>BUILD_DATE: 2026-06-27</span>
+          <span>BUILD_DATE: {__BUILD_DATE__}</span>
         </div>
       </footer>
 
